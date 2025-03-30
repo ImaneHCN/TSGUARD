@@ -1,2 +1,7 @@
+# Directories
 venv/
 __pycache__/
+generated/*
+
+# Excluded files
+!generated/readme.md
