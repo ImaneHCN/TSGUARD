@@ -6,7 +6,7 @@ import numpy as np
 from datetime import datetime
 import base64
 import json
-from TSGUARD_GNN import TDGNN, train_model, simulate_streaming, simulate_streaming_new
+from TSGUARD_GNN import TSGuard, train_model, simulate_streaming, simulate_streaming_new
 import torch
 
 
@@ -49,7 +49,7 @@ DEFAULT_VALUES = {
 train_file = None
 positions_file = None
 sensor_file = None
-model_path = "model_tdgnn.pth"
+model_path = "model_TSGuard.pth"
 # ----------------------------
 # Page Configuration (Must Be First)
 # ----------------------------

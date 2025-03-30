@@ -15,9 +15,9 @@ import base64
 # -------------------------
 # Define Simple GCN Model
 # -------------------------
-class TDGNN(nn.Module):
+class TSGuard(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
-        super(TDGNN, self).__init__()
+        super(TSGuard, self).__init__()
         self.conv1 = GCNConv(input_dim, hidden_dim)
         self.conv2 = GCNConv(hidden_dim, output_dim)
 
@@ -53,7 +53,7 @@ def train_model(train_file, positions_file, model_path='model.pth'):
     sensor_positions = {i: (i % 5, i // 5) for i in range(10)}
     edge_index = build_edge_index(sensor_positions)
 
-    model = TDGNN(input_dim=1, hidden_dim=32, output_dim=1)
+    model = TSGuard(input_dim=1, hidden_dim=32, output_dim=1)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
     loss_fn = nn.MSELoss()
 
@@ -216,7 +216,7 @@ def simulate_streaming(test_file, global_dashboard_placeholder, sliding_chart_pl
 
     graph_size = 10
     edge_index = build_edge_index({i: (i % 5, i // 5) for i in range(graph_size)})
-    model = TDGNN(input_dim=1, hidden_dim=32, output_dim=1)
+    model = TSGuard(input_dim=1, hidden_dim=32, output_dim=1)
     model.load_state_dict(torch.load(model_path))
     model.eval()
 

@@ -10,9 +10,9 @@ from TSGUARD_GNN import train_model
 import torch
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
-class TDGNN(torch.nn.Module):
+class TSGuard(torch.nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
-        super(TDGNN, self).__init__()
+        super(TSGuard, self).__init__()
         self.conv1 = GCNConv(input_dim, hidden_dim)
         self.conv2 = GCNConv(hidden_dim, output_dim)
 
@@ -313,7 +313,7 @@ def draw_graph(graph_size, sensor_values, sensor_states, positions, current_time
         customdata=custom_data,  # On click
     ))
 
-    icon_base64 = get_image_base64("captor_icon.png")
+    icon_base64 = get_image_base64("images/captor_icon.png")
     for sensor_idx in range(graph_size):
         x, y = positions[sensor_idx]
         fig.add_layout_image(
@@ -495,7 +495,7 @@ def main():
         st.title("⏳ Training is running... Please wait.")
         with st.spinner("Training GNN model..."):
             try:
-                model_path = "model_tdgnn.pth"
+                model_path = "model_TSGuard.pth"
                 train_model(training_data_file, positions_file, model_path=model_path)
                 st.success(f"✅ Training completed. Model saved to `{model_path}`")
             except Exception as e:
