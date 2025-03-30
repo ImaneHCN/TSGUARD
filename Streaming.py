@@ -6,31 +6,20 @@ import numpy as np
 from datetime import datetime
 import base64
 import json
-from TSGUARD_GNN import TDGNN, train_model, simulate_streaming, simulate_streaming_new
+from TSGUARD_GNN import train_model
 import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+class TDGNN(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(TDGNN, self).__init__()
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, output_dim)
 
-
-def build_edge_index(node_positions: dict):
-    """
-    Build edge index tensor for GNN based on node positions in a grid-like layout.
-
-    Parameters:
-    - node_positions: dict[int, tuple[int, int]], e.g. {0: (0,0), 1: (1,0), ...}
-
-    Returns:
-    - torch.LongTensor of shape [2, num_edges]
-    """
-    edges = []
-    for i, (x1, y1) in node_positions.items():
-        for j, (x2, y2) in node_positions.items():
-            if i != j:
-                # Connect adjacent nodes (4-neighborhood)
-                if abs(x1 - x2) + abs(y1 - y2) == 1:
-                    edges.append((i, j))
-
-    # Convert to tensor
-    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-    return edge_index
+    def forward(self, x, edge_index):
+        x = F.relu(self.conv1(x, edge_index))
+        x = self.conv2(x, edge_index)
+        return x
 
 
 # ----------------------------
@@ -46,10 +35,6 @@ DEFAULT_VALUES = {
     "gauge_red_max": 100,
     "graph_size": 10,
 }
-train_file = None
-positions_file = None
-sensor_file = None
-model_path = "model_tdgnn.pth"
 # ----------------------------
 # Page Configuration (Must Be First)
 # ----------------------------
@@ -70,10 +55,6 @@ def load_training_data(file):
                 break
     df["datetime"] = pd.to_datetime(df["datetime"])
     df.sort_values("datetime", inplace=True)
-    print("file:",file)
-    global train_file
-    train_file = "/Users/imane.hocine/PycharmProjects/TD-GNN/data/pm25/SampleData/"+file.name
-    print("train_file:",train_file)
     return df
 
 
@@ -86,10 +67,9 @@ def load_sensor_data(file):
             if candidate in df.columns:
                 df.rename(columns={candidate: "datetime"}, inplace=True)
                 break
+    print(df.head())
     df["datetime"] = pd.to_datetime(df["datetime"])
     df.sort_values("datetime", inplace=True)
-    global sensor_file
-    sensor_file = file
     return df
 
 
@@ -101,9 +81,7 @@ def load_positions_data(file):
     for i, row in df.iterrows():
         lat = row["latitude"]
         lon = row["longitude"]
-        positions[i] = (lon, lat)
-    global positions_file
-    positions_file = file
+        positions[i] = (lon, lat)  # x=lon, y=lat for the plotly graph
     return positions
 
 
@@ -407,6 +385,12 @@ def draw_dashboard(df, current_time, sensor_cols):
 # Main Layout
 # ----------------------------
 def main():
+    st.markdown("""
+        <h1 style='text-align: center;'>📡 TSGuard Sensor Streaming Simulation</h1>
+        <hr style='border: 1px solid #ccc;'>
+    """, unsafe_allow_html=True)
+
+    # --- Initialize session state ---
     for key, default in {
         "train_data": None,
         "sim_data": None,
@@ -420,37 +404,36 @@ def main():
         if key not in st.session_state:
             st.session_state[key] = default
 
+    # --- Upload inputs with UNIQUE keys ---
+    training_data_file = st.sidebar.file_uploader(
+        "🧠 Upload Training Data (.csv or .txt)", type=["csv", "txt"], key="file_uploader_training"
+    )
+    sensor_data_file = st.sidebar.file_uploader(
+        "📂 Upload Sensor Data (.csv or .txt)", type=["csv", "txt"], key="file_uploader_sensor"
+    )
+    positions_file = st.sidebar.file_uploader(
+        "📍 Upload Sensor Positions (.csv or .txt)", type=["csv", "txt"], key="file_uploader_positions"
+    )
 
-    st.markdown("""
-        <h1 style='text-align: center;'>📡 TSGuard Sensor Streaming Simulation</h1>
-        <hr style='border: 1px solid #ccc;'>
-    """, unsafe_allow_html=True)
-
-    training_data_file = st.sidebar.file_uploader("🧠 Upload Training Data (.csv or .txt)", type=["csv", "txt"])
-    sensor_data_file = st.sidebar.file_uploader("📂 Upload Sensor Data (.csv or .txt)", type=["csv", "txt"])
-    positions_file = st.sidebar.file_uploader("📍 Upload Sensor Positions (.csv or .txt)", type=["csv", "txt"])
-
-
-    if not sensor_data_file or not positions_file:
-        st.warning("Please upload both sensor data and position files to continue.")
+    # --- Ensure all files are uploaded ---
+    if not sensor_data_file or not positions_file or not training_data_file:
+        st.warning("Please upload **training**, **sensor**, and **position** data files to continue.")
         return
 
+    # --- Load data ---
     tr = load_training_data(training_data_file)
     df = load_sensor_data(sensor_data_file)
     positions = load_positions_data(positions_file)
 
-    if 'train_data' not in st.session_state:
-        st.session_state.train_data = tr.copy()
-    if 'sim_data' not in st.session_state:
-        st.session_state.sim_data = df.copy()
-    if 'running' not in st.session_state:
-        st.session_state.running = False
-    if 'training' not in st.session_state:
-        st.session_state.training = False
+    # --- Store in session state ---
+    st.session_state.train_data = tr.copy()
+    st.session_state.sim_data = df.copy()
 
+    # --- Settings Panel ---
     add_setting_panel()
 
-    col1, col2, col3 = st.columns([1, 1, 1])
+    # --- Control Buttons ---
+    col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("▶️ Start Simulation", use_container_width=True):
             st.session_state.running = True
@@ -458,60 +441,153 @@ def main():
         if st.button("⏹ Stop Simulation", use_container_width=True):
             st.session_state.running = False
     with col3:
-        if st.button("🧠 Start training", use_container_width=True):
+        if st.button("🧠 Start Training", use_container_width=True):
             st.session_state.training = True
 
-    with st.container():
-        graph_placeholder = st.empty()
-        gauge_placeholder = st.empty()
-        sliding_chart_placeholder = st.empty()
-        single_sliding_chart_placeholder = st.empty()
+    # --- UI Placeholders ---
+    graph_placeholder = st.empty()
+    gauge_placeholder = st.empty()
+    sliding_chart_placeholder = st.empty()
+    time_placeholder = st.empty()
+    global_dashboard_placeholder = st.empty()
 
+    # --- Run Simulation ---
     if st.session_state.running:
-        st.markdown("<hr style='border: 1px solid #ccc;'>", unsafe_allow_html=True)
         st.success("✅ Simulation is running. Click 'Stop Simulation' to end it.")
 
-        if st.session_state.get('graph_size'):
-            graph_size = st.session_state['graph_size']
-
+        graph_size = st.session_state.graph_size
         sensor_cols = df.columns[1:(graph_size + 1)]
 
-        line = st.columns(1, gap="small", vertical_alignment="center")
-        st.subheader("Sensor Simulation Graph")
-        graph_placeholder = st.empty()
-        time_placeholder = st.empty()
-
-        # We'll keep a sliding window DF
+        # Sliding window for charts
         sliding_window_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
 
-        # === LINE 3: global time series (col1), missed data gauge (col2) ===
-        st.markdown("---")
-        line3_col1, line3_col2 = st.columns([2, 2])
-        with line3_col1:
-            st.subheader("Global Time Series")
-            global_dashboard_placeholder = st.empty()
-        with line3_col2:
-            st.subheader("10-Step Snapshot")
-            sliding_chart_placeholder = st.empty()
+        for idx, row in df.iterrows():
+            current_time = row["datetime"]
+            svals = [row[col] if col in df.columns else None for col in sensor_cols]
+            sstates = [False if pd.isna(v) else True for v in svals]
 
-        # Now pass the placeholders to simulate_streaming:
-        simulate_streaming(sensor_data_file, global_dashboard_placeholder, sliding_chart_placeholder, positions, model_path)
+            svals = (svals + [None] * graph_size)[:graph_size]
+            sstates = (sstates + [False] * graph_size)[:graph_size]
 
+            row_data = {"datetime": current_time}
+            for i, col in enumerate(sensor_cols):
+                row_data[col] = svals[i]
+            sliding_window_df = pd.concat([sliding_window_df, pd.DataFrame([row_data])], ignore_index=True)
+            if len(sliding_window_df) > graph_size:
+                sliding_window_df = sliding_window_df.tail(graph_size)
 
+            # Draw Graph
+            fig = draw_graph(graph_size, svals, sstates, positions, current_time)
+            time_placeholder.write(f"**Current Time:** {current_time}")
+            graph_placeholder.plotly_chart(fig, use_container_width=True, key=f"graph_{idx}")
 
+            # Charts
+            sliding_chart_placeholder.line_chart(sliding_window_df.set_index("datetime"))
+            df_line, gauge_fig = draw_dashboard(df, current_time, sensor_cols)
+            global_dashboard_placeholder.line_chart(df_line)
+            gauge_placeholder.plotly_chart(gauge_fig, use_container_width=True, key=f"gauge_{idx}")
+
+            time.sleep(1)
+
+    # --- Run Training ---
     if st.session_state.training:
-        # Training loop
         st.markdown("<hr style='border: 1px solid #ccc;'>", unsafe_allow_html=True)
-        st.title(" ⏳ Training is running... Please wait until it is finished.")
-        with st.spinner("Processing...  ⏳"):
-            # TODOO: Use the training algorithm in this section
-            #print(training_data_file)
-            train_model(training_data_file, positions_file, model_path=model_path)
+        st.title("⏳ Training is running... Please wait.")
+        with st.spinner("Training GNN model..."):
+            try:
+                model_path = "model_tdgnn.pth"
+                train_model(training_data_file, positions_file, model_path=model_path)
+                st.success(f"✅ Training completed. Model saved to `{model_path}`")
+            except Exception as e:
+                st.error(f"Training failed: {e}")
             st.session_state.training = False
-            time.sleep(10)  # Simulates a process.
-        st.markdown("<hr style='border: 1px solid #ccc;'>", unsafe_allow_html=True)
-        st.success("✅ Training completed successfully!")
 
+
+def run_streaming_with_imputation(df, positions, model, edge_index, graph_size, sensor_cols,
+                                   sliding_chart_placeholder, global_dashboard_placeholder,
+                                   graph_placeholder, gauge_placeholder, time_placeholder):
+    sliding_window_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
+    global_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
+    last_seen = {col: None for col in sensor_cols}
+    delta_threshold = pd.Timedelta(minutes=st.session_state.get('sigma_threshold', 10))
+
+    colors_map = {col: f"C{i}" for i, col in enumerate(sensor_cols)}  # consistent colors
+
+    for idx, row in df.iterrows():
+        current_time = row["datetime"]
+        svals = []
+        sstates = []
+        imputed_flags = []
+
+        x = torch.full((graph_size, 1), float('nan'))
+
+        for i, col in enumerate(sensor_cols):
+            val = row[col] if col in df.columns else None
+            print(val)
+            if pd.isna(val):
+                # Missing, will check if imputation is needed
+                if last_seen[col] is None or current_time - last_seen[col] > delta_threshold:
+                    sstates.append(False)
+                    imputed_flags.append(True)
+                    svals.append(None)
+                else:
+                    sstates.append(False)
+                    imputed_flags.append(False)
+                    svals.append(None)
+            else:
+                sstates.append(True)
+                imputed_flags.append(False)
+                last_seen[col] = current_time
+                svals.append(val)
+                x[i, 0] = val
+                print(f"[{current_time}] Sensor {col} — value from file: {val}")
+
+        # Imputation
+        for i, (missing, should_impute) in enumerate(zip(pd.isna(x[:, 0]), imputed_flags)):
+            if missing and should_impute:
+                x_impute = x.clone()
+                x_impute[i, 0] = 0
+                with torch.no_grad():
+                    out = model(x_impute, edge_index)
+                    imputed_value = out[i, 0].item()
+                    x[i, 0] = imputed_value
+                    svals[i] = imputed_value
+                    sstates[i] = False
+                    print(f"[{current_time}] Sensor {sensor_cols[i]} — imputed value: {imputed_value:.2f}")
+
+        # Sensor graph
+        fig = draw_graph(graph_size, svals, sstates, positions, current_time)
+        for i, imp in enumerate(imputed_flags):
+            if imp:
+                val = svals[i]
+                fig.add_annotation(
+                    x=positions[i][0], y=positions[i][1] + 0.02,
+                    text=f"<b>{val:.1f}</b>", showarrow=False, font=dict(color="red", size=12)
+                )
+        time_placeholder.write(f"**Current Time:** {current_time}")
+        graph_placeholder.plotly_chart(fig, use_container_width=True)
+
+        # Update DFs
+        row_data = {"datetime": current_time}
+        for i, col in enumerate(sensor_cols):
+            row_data[col] = svals[i]
+        global_df = pd.concat([global_df, pd.DataFrame([row_data])], ignore_index=True)
+        sliding_window_df = pd.concat([sliding_window_df, pd.DataFrame([row_data])], ignore_index=True)
+        if len(sliding_window_df) > 10:
+            sliding_window_df = sliding_window_df.tail(10)
+
+        # Charts
+        global_line = global_df.set_index("datetime")
+        sliding_line = sliding_window_df.set_index("datetime")
+
+        global_dashboard_placeholder.line_chart(global_line, use_container_width=True)
+        sliding_chart_placeholder.line_chart(sliding_line, use_container_width=True)
+
+        # Gauge
+        df_line, gauge_fig = draw_dashboard(global_df, current_time, sensor_cols)
+        gauge_placeholder.plotly_chart(gauge_fig, use_container_width=True)
+
+        time.sleep(1)
 
 if __name__ == '__main__':
     main()
