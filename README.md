@@ -13,18 +13,23 @@ cd <project-directory>
 #### 🖥️ Windows
 ```sh
 python -m venv venv
-source venv\Scripts\activate
+venv\Scripts\activate
 ```
 Or
 ```sh
 python3 -m venv venv
-source venv\Scripts\activate
+venv\Scripts\activate
 ```
 
 #### 🐧 macOS / Linux
 ```sh
 python -m venv venv
 source venv/bin/activate
+```
+Or
+```sh
+python3 -m venv venv
+source venv\Scripts\activate
 ```
 
 ### 3️⃣ Install Dependencies
