@@ -35,14 +35,12 @@ def load_sensor_data(file):
                 break
     df["datetime"] = pd.to_datetime(df["datetime"])
     df.sort_values("datetime", inplace=True)
-    df = df.dropna()
     return df
 
 @st.cache_data
 def load_positions_data(file):
     """Load sensor positions from a CSV file."""
     df = pd.read_csv(file)
-    df = df.dropna()
     positions = {}
     for i, row in df.iterrows():
         lat = row["latitude"]
