@@ -32,6 +32,7 @@ TSGuard/
 │-- utils/                   # Utility functions
 │   │-- visualization.py     # Data visualization functions
 │   │-- config.py            # Configuration settings
+├── images/                  # Image assets used in the application
 │-- docs/screenshots/        # Screenshots for documentation
 │-- data/                    # Placeholder for dataset files
 ```
