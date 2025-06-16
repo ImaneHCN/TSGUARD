@@ -1,3 +1,367 @@
+
+###### Loading data from files #####################################################
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+def remove_leading_zeros(value):
+    return str(value).lstrip('0')
+
+# Load Data 
+latlng = pd.read_csv('/kaggle/input/airq36/pm25/SampleData/pm25_latlng.txt')
+missing_df = pd.read_csv('/kaggle/input/airq36/pm25/SampleData/pm25_missing.txt', parse_dates=['datetime'], index_col='datetime')
+ground_df = pd.read_csv('/kaggle/input/airq36/pm25/SampleData/pm25_ground.txt', parse_dates=['datetime'], index_col='datetime')
+
+# Remove leading zeros from all column names
+missing_df.columns = [col.lstrip('0') if col.isdigit() else col for col in missing_df.columns]
+ground_df.columns = [col.lstrip('0') if col.isdigit() else col for col in ground_df.columns]
+
+
+# Ensure sensor columns are in the same order
+sensor_cols = latlng['sensor_id'].astype(str).tolist()
+
+missing_df = missing_df[sensor_cols]
+ground_df = ground_df[sensor_cols]
+
+# Convert to numpy arrays
+missing_data = missing_df.to_numpy(dtype=np.float32)
+ground_data = ground_df.to_numpy(dtype=np.float32)
+
+########## All the functions needed to create the adjacency matrix ##############################
+from sklearn.metrics.pairwise import euclidean_distances
+from math import radians, sin, cos, sqrt, atan2
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    R = 6371  # Radius of Earth in Km
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+
+    a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    distance = R * c
+    return distance
+
+def create_adjacency_matrix(latlng_df, threshold_type='gaussian', sigma_sq_ratio=0.1):
+    num_sensors = len(latlng_df)
+    dist_matrix = np.zeros((num_sensors, num_sensors))
+
+    for i in range(num_sensors):
+        for j in range(i, num_sensors):
+            lat1, lon1 = latlng_df.iloc[i]['latitude'], latlng_df.iloc[i]['longitude']
+            lat2, lon2 = latlng_df.iloc[j]['latitude'], latlng_df.iloc[j]['longitude']
+            dist = haversine_distance(lat1, lon1, lat2, lon2)
+            dist_matrix[i, j] = dist_matrix[j, i] = dist
+
+    if threshold_type == 'gaussian':
+        # Use a Gaussian kernel to compute weights
+        sigma_sq = dist_matrix.std()**2 * sigma_sq_ratio
+        adj_matrix = np.exp(-dist_matrix**2 / sigma_sq)
+    else: # Simple binary threshold
+        threshold = np.mean(dist_matrix) * 0.5
+        adj_matrix = (dist_matrix <= threshold).astype(float)
+
+    # Add self-loops
+    np.fill_diagonal(adj_matrix, 1)
+
+    # Symmetric normalization
+    D = np.diag(np.sum(adj_matrix, axis=1))
+    D_inv_sqrt = np.linalg.inv(np.sqrt(D))
+    adj_matrix_normalized = D_inv_sqrt @ adj_matrix @ D_inv_sqrt
+
+    return torch.FloatTensor(adj_matrix_normalized)
+
+# Create the matrix
+adj_matrix = create_adjacency_matrix(latlng, sigma_sq_ratio=0.1)
+############################################ spliting the dataset, normalization, you have to change the path where the scalar_parms.json file will be save to use it in test and real imputaion ############### 
+import numpy as np
+import json
+
+# Pre-impute missing values (forward fill then backward fill)
+imputed_df = missing_df.fillna(method='ffill').fillna(method='bfill')
+imputed_data = imputed_df.to_numpy(dtype=np.float32)
+
+# Define loss mask, 1 where data was artificially made missing, 0 otherwise
+loss_mask = np.where(np.isnan(missing_data) & ~np.isnan(ground_data), 1.0, 0.0).astype(np.float32)
+
+# Extract the month from the datetime index 
+months = missing_df.index.month
+
+# Define month lists for splitting
+train_month_list = [1, 2, 4, 5, 7, 8, 10, 11]
+valid_month_list = [2, 5, 8, 11]   # Subset of train months selected 
+test_month_list  = [3, 6, 9, 12]
+
+# Create boolean masks for each split based on the month
+train_slice = np.isin(months, train_month_list)
+valid_slice = np.isin(months, valid_month_list)
+test_slice  = np.isin(months, test_month_list)
+
+# Normalization (Min-Max) 
+# Fit scaler ONLY on training data
+train_imputed_data = imputed_data[train_slice]
+min_val = np.min(train_imputed_data)
+max_val = np.max(train_imputed_data)
+
+scaler = lambda x: (x - min_val) / (max_val - min_val)
+inv_scaler = lambda x: x * (max_val - min_val) + min_val
+
+# Convert NumPy-specific float types to standard Python floats
+scaler_params = {
+    'min_val': float(min_val), 
+    'max_val': float(max_val)
+}
+
+
+#save scaler_parms to use for real imputaion
+
+
+SCALER_PARAMS_PATH = 'scaler_params.json'
+with open(SCALER_PARAMS_PATH, 'w') as f:
+    json.dump(scaler_params, f, indent=4) # Using indent makes the file human-readable
+
+
+# Apply scaler to all data
+imputed_data_normalized = scaler(imputed_data)
+ground_data_normalized = scaler(ground_data)
+# Replace NaNs in ground truth with 0 after scaling for loss calculation
+ground_data_normalized = np.nan_to_num(ground_data_normalized, nan=0.0)
+
+#  Create final data splits
+X_train, y_train, mask_train = imputed_data_normalized[train_slice], ground_data_normalized[train_slice], loss_mask[train_slice]
+X_val, y_val, mask_val = imputed_data_normalized[valid_slice], ground_data_normalized[valid_slice], loss_mask[valid_slice]
+X_test, y_test, mask_test = imputed_data_normalized[test_slice], ground_data_normalized[test_slice], loss_mask[test_slice]
+
+
+######################################################## create the dataset and dataloaders #############################################
+class SpatioTemporalDataset(Dataset):
+    def __init__(self, X, y, mask, seq_len=24):
+        self.X = torch.FloatTensor(X)
+        self.y = torch.FloatTensor(y)
+        self.mask = torch.FloatTensor(mask)
+        self.seq_len = seq_len
+
+    def __len__(self):
+        return len(self.X) - self.seq_len + 1
+
+    def __getitem__(self, idx):
+        return (
+            self.X[idx : idx + self.seq_len],
+            self.y[idx : idx + self.seq_len],
+            self.mask[idx : idx + self.seq_len],
+        )
+
+#  Hyperparameters 
+SEQ_LEN = 24 # Use 24 hours of data to impute
+BATCH_SIZE = 32
+
+#  Create Datasets 
+train_dataset = SpatioTemporalDataset(X_train, y_train, mask_train, seq_len=SEQ_LEN)
+val_dataset = SpatioTemporalDataset(X_val, y_val, mask_val, seq_len=SEQ_LEN)
+test_dataset = SpatioTemporalDataset(X_test, y_test, mask_test, seq_len=SEQ_LEN)
+
+# - Create DataLoaders 
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+################################################ The model architecture and initialization #######################
+import torch.nn as nn
+
+
+
+class GraphConvolution(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(GraphConvolution, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # The weight matrix transforms features AFTER aggregation.
+        # The input to this transformation has the same dimension as the number of nodes.
+        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, x, adj):
+        # x shape: (batch_size, num_nodes)
+        # adj shape: (num_nodes, num_nodes)
+        
+        # Correct order of operations: (Â * X) * W
+        # 1. Aggregate features from neighbors (Â * X)
+        # To handle the batch, we compute Â * X^T and then transpose the result.
+        aggregated_features = torch.spmm(adj, x.t()).t() # (N,N) @ (N,B) -> (N,B) -> (B,N)
+        
+        # 2. Transform the aggregated features (result * W)
+        output = torch.mm(aggregated_features, self.weight) # (B,N) @ (N, F_out) -> (B, F_out)
+        
+        return output
+
+class GCNLSTMImputer(nn.Module):
+    def __init__(self, adj, num_nodes, in_features, gcn_hidden, lstm_hidden, out_features):
+        super(GCNLSTMImputer, self).__init__()
+        self.adj = adj
+        self.gcn = GraphConvolution(in_features, gcn_hidden)
+        self.lstm = nn.LSTM(gcn_hidden, lstm_hidden, batch_first=True)
+        self.fc = nn.Linear(lstm_hidden, out_features)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        # x shape: (batch_size, seq_len, num_nodes)
+        batch_size, seq_len, num_nodes = x.shape
+        gcn_outputs = []
+        for t in range(seq_len):
+            # Apply GCN at each time step
+            gcn_out = self.relu(self.gcn(x[:, t, :], self.adj))
+            gcn_outputs.append(gcn_out.unsqueeze(1))
+        
+        # Concatenate GCN outputs along the sequence dimension
+        gcn_sequence = torch.cat(gcn_outputs, dim=1) # (batch_size, seq_len, gcn_hidden)
+        
+        # Feed sequence to LSTM
+        lstm_out, _ = self.lstm(gcn_sequence) # (batch_size, seq_len, lstm_hidden)
+        
+        # Pass LSTM output to the final fully connected layer
+        output = self.fc(lstm_out) # (batch_size, seq_len, out_features) which is num_nodes
+        
+        return output
+
+#  Model initialization 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+NUM_NODES = missing_data.shape[1]
+GCN_HIDDEN = 64
+LSTM_HIDDEN = 64
+
+model = GCNLSTMImputer(
+    adj=adj_matrix.to(device),
+    num_nodes=NUM_NODES,
+    in_features=NUM_NODES,
+    gcn_hidden=GCN_HIDDEN,
+    lstm_hidden=LSTM_HIDDEN,
+    out_features=NUM_NODES
+).to(device)
+
+
+######################### training, you have to change the path where you want to save the model #####################################################################
+import torch.optim as optim
+
+# Training Setup 
+EPOCHS = 20 # Adjust as needed
+LEARNING_RATE = 0.001
+
+criterion = nn.MSELoss(reduction='none') # Use 'none' to apply mask later
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+def masked_loss(outputs, targets, mask):
+    loss = criterion(outputs, targets)
+    masked_loss = loss * mask
+    # We only want the average over the non-zero elements of the mask
+    return torch.sum(masked_loss) / torch.sum(mask)
+
+# Training Loop
+for epoch in range(EPOCHS):
+    model.train()
+    total_train_loss = 0
+    
+    for inputs, targets, mask in train_loader:
+        inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
+        
+        optimizer.zero_grad()
+        
+        outputs = model(inputs)
+        
+        loss = masked_loss(outputs, targets, mask)
+        
+        # Handle cases where a batch might have no artificial missing values
+        if not torch.isnan(loss) and torch.sum(mask) > 0:
+            loss.backward()
+            optimizer.step()
+            total_train_loss += loss.item()
+
+    # validation 
+    model.eval()
+    total_val_loss = 0
+    with torch.no_grad():
+        for inputs, targets, mask in val_loader:
+            inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
+            outputs = model(inputs)
+            loss = masked_loss(outputs, targets, mask)
+            if not torch.isnan(loss) and torch.sum(mask) > 0:
+                total_val_loss += loss.item()
+
+    avg_train_loss = total_train_loss / len(train_loader)
+    avg_val_loss = total_val_loss / len(val_loader)
+    #  Save the Model 
+    MODEL_SAVE_PATH = "gcn_lstm_imputer.pth"
+    torch.save(model.state_dict(), MODEL_SAVE_PATH)
+    # print the train loss and validation 
+    print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+
+################################# evaluation #####################################################
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+model.eval()
+all_outputs = []
+all_targets = []
+all_masks = []
+
+with torch.no_grad():
+    for inputs, targets, mask in test_loader:
+        inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
+        outputs = model(inputs)
+        
+        all_outputs.append(outputs.cpu().numpy())
+        all_targets.append(targets.cpu().numpy())
+        all_masks.append(mask.cpu().numpy())
+
+# Concatenate all batch results
+all_outputs = np.concatenate(all_outputs)
+all_targets = np.concatenate(all_targets)
+all_masks = np.concatenate(all_masks)
+
+# Inverse transform to get values in original scale
+outputs_unscaled = inv_scaler(all_outputs)
+targets_unscaled = inv_scaler(all_targets)
+
+# Filter to only the values that were imputed
+mask_flat = all_masks.flatten() > 0.5
+imputed_values = outputs_unscaled.flatten()[mask_flat]
+ground_truth_values = targets_unscaled.flatten()[mask_flat]
+
+# Calculate final metrics
+mae = mean_absolute_error(ground_truth_values, imputed_values)
+rmse = np.sqrt(mean_squared_error(ground_truth_values, imputed_values))
+
+print("\n-- Test Set Evaluation --")
+print(f"MAE on imputed values: {mae:.4f}")
+print(f"RMSE on imputed values: {rmse:.4f}")
+
+#  Display a sample imputation 
+print("\n-- Sample Imputation ---")
+# Find a sample in the test set where imputation happened
+sample_idx = np.where(np.sum(all_masks, axis=(0, 2)) > 0)[0]
+if len(sample_idx) > 0:
+    sample_idx = sample_idx[0] # Pick the first one
+    imputation_locs = np.where(all_masks[sample_idx, :, :] > 0.5)
+
+    print(f"Showing comparison for a random time slice (index {sample_idx}) and sensor.")
+    
+    # Get the first location (time, sensor) where imputation occurred in this sample
+    t_idx, sensor_idx = imputation_locs[1][1], imputation_locs[1][95]
+    
+    imputed_val = outputs_unscaled[sample_idx, t_idx, sensor_idx]
+    ground_val = targets_unscaled[sample_idx, t_idx, sensor_idx]
+    
+    print(f"Sensor ID: {sensor_cols[sensor_idx]}")
+    print(f"Time Step: {t_idx}")
+    print(f"Imputed Value: {imputed_val:.2f}")
+    print(f"Ground Truth Value: {ground_val:.2f}")
+else:
+    print("No artificial missing values found in the first few test samples to display.")
+
+######################################################################################################################
+
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
