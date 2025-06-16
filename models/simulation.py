@@ -5,12 +5,14 @@ import torch.nn as nn
 import pandas as pd
 import numpy as np
 import models.sim_helper as helper
-import utils.visualization as vz
-
-from utils.config import DEFAULT_VALUES
-
+import streamlit as st
 import plotly.graph_objects as go
+import pandas as pd
 import plotly.express as px
+from utils.visualization import draw_graph, draw_dashboard
+from utils.config import DEFAULT_VALUES
+import time
+
 def plot_sliding_custom_chart(sliding_df, sstates, sensor_cols):
     fig = go.Figure()
 
@@ -126,11 +128,76 @@ def train_model(train_file, positions_file, model_path='model.pth'):
     print("✅ Model saved to", model_path)
 
 
-def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_placeholder, gauge_placeholder):
-    import plotly.graph_objects as go
-    from utils.visualization import draw_graph, draw_dashboard
-    import time
 
+
+
+
+def draw_full_time_series(global_df, sim_file, sensor_cols, sensor_color_map):
+    fig = go.Figure()
+    for col in sensor_cols:
+        color = sensor_color_map[col]
+        x_vals = global_df["datetime"]
+        y_vals = global_df[col]
+
+        segment_x, segment_y, segment_state = [], [], []
+        for x, y in zip(x_vals, y_vals):
+            if pd.isna(y):
+                if len(segment_x) >= 2:
+                    is_imputed = any(pd.isna(sim_file.loc[t, col]) for t in segment_x if t in sim_file.index)
+                    fig.add_trace(go.Scatter(
+                        x=segment_x,
+                        y=segment_y,
+                        mode="lines+markers",
+                        name=f"Sensor {col}",
+                        line=dict(color="red" if is_imputed else color),
+                        marker=dict(size=6, color="red" if is_imputed else color),
+                        showlegend=False
+                    ))
+                segment_x, segment_y, segment_state = [], [], []
+                continue
+            segment_x.append(x)
+            segment_y.append(y)
+
+        if len(segment_x) >= 2:
+            is_imputed = any(pd.isna(sim_file.loc[t, col]) for t in segment_x if t in sim_file.index)
+            fig.add_trace(go.Scatter(
+                x=segment_x,
+                y=segment_y,
+                mode="lines+markers",
+                name=f"Sensor {col}",
+                line=dict(color="red" if is_imputed else color),
+                marker=dict(size=6, color="red" if is_imputed else color),
+                showlegend=False
+            ))
+
+    for col in sensor_cols:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode='markers',
+            marker=dict(size=8, color=sensor_color_map[col]),
+            legendgroup=col,
+            showlegend=True,
+            name=f"Sensor {col}"
+        ))
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None],
+        mode='markers',
+        marker=dict(size=8, color="red"),
+        legendgroup="imputed",
+        showlegend=True,
+        name="Imputed Segment"
+    ))
+    fig.update_layout(
+        title="Global Time Series",
+        xaxis_title="Time",
+        yaxis_title="Sensor Value",
+        margin=dict(l=20, r=20, t=40, b=20),
+        legend_title="Sensors"
+    )
+    return fig
+
+
+def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_placeholder, gauge_placeholder):
     if st.session_state.get('graph_size'):
         graph_size = st.session_state['graph_size']
     else:
@@ -138,7 +205,6 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
 
     sensor_cols = sim_file.columns[1:(graph_size + 1)]
 
-    # === Load imputed data ===
     imputed_df = pd.read_csv("pm25_imputed_live.csv")
     imputed_df["datetime"] = pd.to_datetime(imputed_df["datetime"], errors="coerce")
     sim_file["datetime"] = pd.to_datetime(sim_file["datetime"], errors="coerce")
@@ -149,7 +215,6 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
     imputed_df.set_index("datetime", inplace=True)
     sim_file.set_index("datetime", inplace=True)
 
-    # === Placeholders ===
     st.subheader("Sensor Simulation Graph")
     graph_placeholder = st.empty()
     time_placeholder = st.empty()
@@ -169,16 +234,19 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
 
     sliding_window_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
     global_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
-    station_colors = px.colors.qualitative.Plotly
+
+    sensor_custom_colors = [
+        "#000000", "#003366", "#009999", "#006600", "#66CC66",
+        "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"
+    ]
+    sensor_color_map = {col: sensor_custom_colors[i % len(sensor_custom_colors)] for i, col in enumerate(sensor_cols)}
 
     for current_time, row in sim_file.iterrows():
         if current_time >= pd.Timestamp("2014-05-09 09:00:00"):
             break
-        # Skip timestamps at 00:00:00
         if current_time.time().strftime("%H:%M:%S") == "00:00:00":
             continue
         if current_time not in imputed_df.index:
-            st.warning(f"No imputed data found for time {current_time}. Skipping.")
             continue
 
         imputed_row = imputed_df.loc[current_time]
@@ -186,13 +254,15 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
 
         for col in sensor_cols:
             val = row[col]
+            imputed_col = col.lstrip("0")
             if pd.isna(val):
-                imputed_val = imputed_row.get(col)
+                imputed_val = imputed_row.get(imputed_col)
                 svals.append(imputed_val)
-                sstates.append(False)  # imputed
+                sstates.append(False)
+                print(f"[IMPUTED] Time: {current_time}, Sensor: {col} (-> {imputed_col}), Value: {imputed_val}")
             else:
                 svals.append(val)
-                sstates.append(True)  # real
+                sstates.append(True)
 
         svals = (svals + [None] * graph_size)[:graph_size]
         sstates = (sstates + [False] * graph_size)[:graph_size]
@@ -201,19 +271,16 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
         for i, col in enumerate(sensor_cols):
             row_data[col] = svals[i]
 
-        # === Update dataframes ===
         sliding_window_df = pd.concat([sliding_window_df, pd.DataFrame([row_data])], ignore_index=True)
         global_df = pd.concat([global_df, pd.DataFrame([row_data])], ignore_index=True)
 
         if len(sliding_window_df) > graph_size:
             sliding_window_df = sliding_window_df.tail(graph_size)
 
-        # === Draw sensor graph ===
         fig = draw_graph(graph_size, svals, sstates, positions, current_time)
         time_placeholder.write(f"**Current Time**: {current_time}")
         graph_placeholder.plotly_chart(fig, use_container_width=True, key=f"graph_{current_time}")
 
-        # === Build sstates per column for color-coding lines ===
         sstate_by_col = {}
         for col in sensor_cols:
             sstate_by_col[col] = []
@@ -222,46 +289,83 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
                 real = not pd.isna(sim_file.loc[timestamp, col]) if timestamp in sim_file.index else False
                 sstate_by_col[col].append(real)
 
-        # === Plot sliding window chart (custom) ===
         sliding_fig = go.Figure()
         for i, col in enumerate(sensor_cols):
-            color = station_colors[i % len(station_colors)]
-            x_vals = sliding_window_df["datetime"]
-            y_vals = sliding_window_df[col]
+            color = sensor_color_map[col]
+            x_vals = list(sliding_window_df["datetime"])
+            y_vals = list(sliding_window_df[col])
             states = sstate_by_col[col]
 
-            segment_x, segment_y, segment_color = [], [], []
-            for x, y, real in zip(x_vals, y_vals, states):
-                if pd.isna(y): continue
+            segment_x, segment_y, segment_state = [], [], []
+
+            for x, y, state in zip(x_vals, y_vals, states):
+                if pd.isna(y):
+                    continue
                 segment_x.append(x)
                 segment_y.append(y)
-                segment_color.append("red" if not real else color)
+                segment_state.append(state)
 
+                if len(segment_x) >= 2:
+                    is_imputed_segment = any(not s for s in segment_state)
+                    seg_color = "red" if is_imputed_segment else color
+
+                    sliding_fig.add_trace(go.Scatter(
+                        x=segment_x,
+                        y=segment_y,
+                        mode="lines+markers",
+                        name=f"Sensor {col}",
+                        line=dict(color=seg_color),
+                        marker=dict(size=6, color=seg_color),
+                        showlegend=False
+                    ))
+                    segment_x = [segment_x[-1]]
+                    segment_y = [segment_y[-1]]
+                    segment_state = [segment_state[-1]]
+
+            if len(segment_x) >= 2:
+                seg_color = "red" if any(s == False for s in segment_state) else color
+                sliding_fig.add_trace(go.Scatter(
+                    x=segment_x,
+                    y=segment_y,
+                    mode="lines+markers",
+                    name=f"Sensor {col}",
+                    line=dict(color=seg_color),
+                    marker=dict(size=6, color=seg_color),
+                    showlegend=False
+                ))
+
+        for col in sensor_cols:
             sliding_fig.add_trace(go.Scatter(
-                x=segment_x,
-                y=segment_y,
-                mode="lines+markers",
-                name=f"Sensor {col}",
-                line=dict(color=color),
-                marker=dict(color=segment_color, size=6)
+                x=[None], y=[None],
+                mode='markers',
+                marker=dict(size=8, color=sensor_color_map[col]),
+                legendgroup=col,
+                showlegend=True,
+                name=f"Sensor {col}"
             ))
+        sliding_fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode='markers',
+            marker=dict(size=8, color="red"),
+            legendgroup="imputed",
+            showlegend=True,
+            name="Imputed Segment"
+        ))
 
         sliding_fig.update_layout(
             title="10-Step Snapshot",
             xaxis_title="Time",
             yaxis_title="Sensor Value",
-            margin=dict(l=20, r=20, t=40, b=20)
+            margin=dict(l=20, r=20, t=40, b=20),
+            legend_title="Sensors"
         )
         sliding_chart_placeholder.plotly_chart(sliding_fig, use_container_width=True, key=f"sliding_{current_time}")
 
-        # === Global dashboard and gauge ===
-        df_line, gauge_fig = draw_dashboard(global_df.copy(), current_time, sensor_cols)
+        full_ts_fig = draw_full_time_series(global_df.copy(), sim_file, sensor_cols, sensor_color_map)
         with line3_col1:
-            global_dashboard_placeholder.line_chart(df_line)
+            global_dashboard_placeholder.plotly_chart(full_ts_fig, use_container_width=True, key=f"global_{current_time}")
         with line3_col2:
+            df_line, gauge_fig = draw_dashboard(global_df.copy(), current_time, sensor_cols)
             gauge_placeholder.plotly_chart(gauge_fig, use_container_width=True, key=f"gauge_{current_time}")
 
-
         time.sleep(1)
-
-
