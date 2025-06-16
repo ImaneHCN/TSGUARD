@@ -17,13 +17,20 @@ def draw_graph(graph_size, sensor_values, sensor_states, positions, current_time
     """
     # This is used to persist the on hover text
     # when the graph is rendered.
-    
+    station_colors = [
+        "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b",
+        "#e377c2", "#7f7f7f", "#bcbd22", "#17becf", "#d62728"
+    ]
+
+    # Extend colors if graph_size > 10
+    while len(station_colors) < graph_size:
+        station_colors += station_colors
     node_x, node_y, colors, texts, hover_texts, custom_data = [], [], [], [], [], []
     for sensor_idx in range(graph_size):
         x, y = positions[sensor_idx]
         node_x.append(x)
         node_y.append(y)
-        colors.append("#90ee90" if sensor_states[sensor_idx] else "red")
+        colors.append("red" if not sensor_states[sensor_idx] else station_colors[sensor_idx])
         val = sensor_values[sensor_idx]
         texts.append("miss" if pd.isna(val) else str(val))
 

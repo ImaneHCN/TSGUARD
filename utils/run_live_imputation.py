@@ -13,7 +13,7 @@ from tqdm import tqdm
 from IPython.display import display
 
 
-# Geographical Helper Functions 
+# Geographical Helper Functions
 def haversine_distance(lat1, lon1, lat2, lon2):
     R = 6371
     lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
@@ -41,7 +41,7 @@ def create_adjacency_matrix(latlng_df, sigma_sq_ratio=0.1):
     adj_matrix_normalized = D_inv_sqrt @ adj_matrix @ D_inv_sqrt
     return torch.FloatTensor(adj_matrix_normalized)
 
-#  Model Architecture Definitions 
+#  Model Architecture Definitions
 class GraphConvolution(nn.Module):
     def __init__(self, in_features, out_features):
         super(GraphConvolution, self).__init__()
@@ -68,7 +68,7 @@ class GCNLSTMImputer(nn.Module):
         for t in range(seq_len):
             gcn_out = self.relu(self.gcn(x[:, t, :], self.adj))
             gcn_outputs.append(gcn_out.unsqueeze(1))
-        
+
         gcn_sequence = torch.cat(gcn_outputs, dim=1)
         lstm_out, _ = self.lstm(gcn_sequence)
         output = self.fc(lstm_out)
@@ -96,11 +96,11 @@ def run_live_imputation(
         raise FileNotFoundError("One or more required input files are missing.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     # Load coordinates and determine sensor order
     latlng_df = pd.read_csv(latlng_path)
     sensor_cols = latlng_df['sensor_id'].astype(str).tolist()
-    
+
     # Load scaler parameters and create scaler functions
     with open(scaler_params_path, 'r') as f:
         scaler_params = json.load(f)
@@ -110,7 +110,7 @@ def run_live_imputation(
 
     # Initialization of the Model and Adjacency Matrix ---
     adj_matrix = create_adjacency_matrix(latlng_df)
-    
+
     # These parameters must match the model that was trained
     model_config = {'NUM_NODES': len(sensor_cols), 'GCN_HIDDEN': 64, 'LSTM_HIDDEN': 64, 'EVAL_LENGTH': 36}
 
@@ -130,10 +130,11 @@ def run_live_imputation(
     # Prepare Data and Output Files ---
     original_missing_df = pd.read_csv(missing_csv_path, index_col='datetime', parse_dates=True)
     # Remove leading zeros from all column names
-    original_missing_df.columns = [col.lstrip('0') if col.isdigit() else col for col in missing_df.columns]
-    #  Fix column order 
+    original_missing_df.columns = [col.lstrip('0') if col.isdigit() else col for col in original_missing_df.columns]
+
+    #  Fix column order
     original_missing_df = original_missing_df[sensor_cols]
-    
+
     if simulation_limit is None:
         simulation_limit = len(original_missing_df)
 
@@ -155,9 +156,9 @@ def run_live_imputation(
 
             with torch.no_grad():
                 output_sequence = model(input_tensor)
-            
+
             last_step_prediction = inv_scaler(output_sequence[0, -1, :].cpu().numpy())
-            
+
             missing_cols_indices = np.where(original_missing_df.iloc[t].isnull())[0]
             for col_idx in missing_cols_indices:
                 imputed_df_live.iat[t, col_idx] = last_step_prediction[col_idx]
@@ -166,9 +167,9 @@ def run_live_imputation(
         # Append the current row (original or imputed) to the files
         imputed_df_live.iloc[[t]].to_csv(output_data_path, mode='a', header=False)
         imputation_mask.iloc[[t]].to_csv(output_mask_path, mode='a', header=False)
-        
+
         time.sleep(simulation_speed)
-        
+
     print("\nSimulation finished.")
     return output_data_path, output_mask_path
 
@@ -187,7 +188,7 @@ def visualize_imputation_from_files(data_path, mask_path, rows_to_display=150):
         return
 
     print("Styling the output DataFrame. Imputed values are highlighted in red.")
-    
+
 
     # Slice both the data and the mask to the desired display size
     display_df = imputed_df.head(rows_to_display).copy().round(2)
@@ -197,15 +198,15 @@ def visualize_imputation_from_files(data_path, mask_path, rows_to_display=150):
     style_df = pd.DataFrame('', index=display_df.index, columns=display_df.columns)
 
     # Use the boolean `display_mask` to set the style string only for cells
-    
+
     style_df[display_mask] = 'background-color: lightcoral; color: white'
 
     # Apply the DataFrame of styles to the data DataFrame.
 
     styled_output = display_df.style.apply(lambda x: style_df, axis=None)
-    
-   
-    
+
+
+
     display(styled_output)
 
     display_df = imputed_df.head(rows_to_display).copy().round(2)
@@ -216,11 +217,11 @@ def visualize_imputation_from_files(data_path, mask_path, rows_to_display=150):
 
 if __name__ == '__main__':
     # Configuration, paths to imputs files
-    
-    MODEL_FILE = '/kaggle/working/gcn_lstm_imputer.pth'
-    MISSING_DATA_FILE = '/kaggle/input/airq36/pm25/SampleData/pm25_missing.txt'
-    LATLNG_FILE = '/kaggle/input/airq36/pm25/SampleData/pm25_latlng.txt'
-    SCALER_PARAMS_FILE = '/kaggle/working/scaler_params.json'
+
+    MODEL_FILE = './models/gcn_lstm_imputer.pth'
+    MISSING_DATA_FILE = './pm25/SampleData/pm25_missing.txt'
+    LATLNG_FILE = './pm25/SampleData/pm25_latlng.txt'
+    SCALER_PARAMS_FILE = './models/scaler_params.json'
 
     #  Run the Imputation ---This will generate the output CSV files.
     final_data, final_mask = run_live_imputation(
@@ -228,8 +229,8 @@ if __name__ == '__main__':
         missing_csv_path=MISSING_DATA_FILE,
         latlng_path=LATLNG_FILE,
         scaler_params_path=SCALER_PARAMS_FILE,
-        simulation_limit=200, # Set to None to run on the whole file
-        simulation_speed=1 # Set to 0 for max speed
+        simulation_limit=200,  # Set to None to run on the whole file
+        simulation_speed=1  # Set to 0 for max speed
     )
 
     #  Visualize the Results (Optional) ---

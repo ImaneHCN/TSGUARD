@@ -2,11 +2,13 @@ import streamlit as st
 import pandas as pd
 import base64
 
+
 def get_image_base64(image_path):
     """Convert image to base64 for HTML embedding"""
     with open(image_path, "rb") as f:
         return f"data:image/png;base64,{base64.b64encode(f.read()).decode()}"
-    
+
+
 # ----------------------------
 # Data Loading (Cached)
 # ----------------------------
@@ -24,6 +26,7 @@ def load_training_data(file):
     df = df.dropna()
     return df
 
+
 @st.cache_data
 def load_sensor_data(file):
     """Load sensor data from a .txt file (CSV format)."""
@@ -37,6 +40,7 @@ def load_sensor_data(file):
     df.sort_values("datetime", inplace=True)
     return df
 
+
 @st.cache_data
 def load_positions_data(file):
     """Load sensor positions from a CSV file."""
@@ -48,11 +52,13 @@ def load_positions_data(file):
         positions[i] = (lon, lat)  # x=lon, y=lat for the plotly graph
     return positions
 
+
 def init_files(training_data_file, sensor_data_file, positions_file):
     tr = load_training_data(training_data_file)
     df = load_sensor_data(sensor_data_file)
     pf = load_positions_data(positions_file)
     return tr, df, pf
+
 
 def init_states(training_data_file, sensor_data_file, positions_file):
     if 'train_data' not in st.session_state:

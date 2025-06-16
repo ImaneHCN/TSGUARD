@@ -5,3 +5,6 @@ generated/*
 
 # Excluded files
 !generated/readme.md
+!pm25_imputation_mask.csv
+!pm25_imputed_live.csv
+!model_tdgnn.pth
