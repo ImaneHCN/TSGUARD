@@ -142,34 +142,33 @@ def draw_full_time_series(global_df, sim_file, sensor_cols, sensor_color_map):
         segment_x, segment_y, segment_state = [], [], []
         for x, y in zip(x_vals, y_vals):
             if pd.isna(y):
-                if len(segment_x) >= 2:
-                    is_imputed = any(pd.isna(sim_file.loc[t, col]) for t in segment_x if t in sim_file.index)
-                    fig.add_trace(go.Scatter(
-                        x=segment_x,
-                        y=segment_y,
-                        mode="lines+markers",
-                        name=f"Sensor {col}",
-                        line=dict(color="red" if is_imputed else color),
-                        marker=dict(size=6, color="red" if is_imputed else color),
-                        showlegend=False
-                    ))
-                segment_x, segment_y, segment_state = [], [], []
-                continue
+                continue  # Skip missing entirely
+
+            is_real = not pd.isna(sim_file.loc[x, col]) if x in sim_file.index else False
+
             segment_x.append(x)
             segment_y.append(y)
+            segment_state.append(is_real)
 
+        # Now construct segments based on changes in imputation state
         if len(segment_x) >= 2:
-            is_imputed = any(pd.isna(sim_file.loc[t, col]) for t in segment_x if t in sim_file.index)
-            fig.add_trace(go.Scatter(
-                x=segment_x,
-                y=segment_y,
-                mode="lines+markers",
-                name=f"Sensor {col}",
-                line=dict(color="red" if is_imputed else color),
-                marker=dict(size=6, color="red" if is_imputed else color),
-                showlegend=False
-            ))
+            for i in range(1, len(segment_x)):
+                x_seg = [segment_x[i-1], segment_x[i]]
+                y_seg = [segment_y[i-1], segment_y[i]]
+                seg_is_real = segment_state[i-1] and segment_state[i]
+                seg_color = color if seg_is_real else "red"
 
+                fig.add_trace(go.Scatter(
+                    x=x_seg,
+                    y=y_seg,
+                    mode="lines+markers",
+                    name=f"Sensor {col}",
+                    line=dict(color=seg_color),
+                    marker=dict(size=6, color=seg_color),
+                    showlegend=False
+                ))
+
+    # Legends
     for col in sensor_cols:
         fig.add_trace(go.Scatter(
             x=[None], y=[None],
@@ -196,6 +195,38 @@ def draw_full_time_series(global_df, sim_file, sensor_cols, sensor_color_map):
     )
     return fig
 
+def draw_gauge_figure(sim_file, current_time, sensor_cols):
+    green_min, green_max = DEFAULT_VALUES["gauge_green_min"], DEFAULT_VALUES["gauge_green_max"]
+    yellow_min, yellow_max = DEFAULT_VALUES["gauge_yellow_min"], DEFAULT_VALUES["gauge_yellow_max"]
+    red_min, red_max = DEFAULT_VALUES["gauge_red_min"], DEFAULT_VALUES["gauge_red_max"]
+
+    if st.session_state.get('missing_value_thresholds'):
+        thresholds = st.session_state['missing_value_thresholds']
+        green_min, green_max = thresholds.get("Green", (green_min, green_max))
+        yellow_min, yellow_max = thresholds.get("Yellow", (yellow_min, yellow_max))
+        red_min, red_max = thresholds.get("Red", (red_min, red_max))
+
+    sim_file_up_to_now = sim_file[sim_file.index <= current_time]
+    total = sim_file_up_to_now[sensor_cols].size
+    missed = sim_file_up_to_now[sensor_cols].isna().sum().sum()
+    pmiss = (missed / total) * 100 if total > 0 else 0
+
+    gauge_fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=pmiss,
+        title={"text": "Overall Missed Data (%)"},
+        gauge={
+            "axis": {"range": [0, 100]},
+            "bar": {"color": "red" if pmiss > red_max else "green"},
+            "steps": [
+                {"range": [green_min, green_max], "color": "lightgreen"},
+                {"range": [yellow_min, yellow_max], "color": "yellow"},
+                {"range": [red_min, red_max], "color": "red"}
+            ]
+        }
+    ))
+    gauge_fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
+    return gauge_fig
 
 def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_placeholder, gauge_placeholder):
     if st.session_state.get('graph_size'):
@@ -365,7 +396,7 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
         with line3_col1:
             global_dashboard_placeholder.plotly_chart(full_ts_fig, use_container_width=True, key=f"global_{current_time}")
         with line3_col2:
-            df_line, gauge_fig = draw_dashboard(global_df.copy(), current_time, sensor_cols)
+            gauge_fig = draw_gauge_figure(sim_file, current_time, sensor_cols)
             gauge_placeholder.plotly_chart(gauge_fig, use_container_width=True, key=f"gauge_{current_time}")
 
         time.sleep(1)
