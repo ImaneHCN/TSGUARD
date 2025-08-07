@@ -259,9 +259,8 @@ def masked_loss(outputs, targets, mask):
     # We only want the average over the non-zero elements of the mask
     return torch.sum(masked_loss) / torch.sum(mask)
 
-# Training Loop
+model.train()
 for epoch in range(EPOCHS):
-    model.train()
     total_train_loss = 0
     
     for inputs, targets, mask in train_loader:

@@ -1,17 +1,99 @@
-import streamlit as st
+import json
 import time
 import torch
 import torch.nn as nn
 import pandas as pd
 import numpy as np
+from torch import optim
+from torch.utils.data import DataLoader, Dataset
 import models.sim_helper as helper
 import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
-import plotly.express as px
 from utils.visualization import draw_graph, draw_dashboard
 from utils.config import DEFAULT_VALUES
 import time
+import helpers as Help
+
+
+class GraphConvolution(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(GraphConvolution, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # The weight matrix transforms features AFTER aggregation.
+        # The input to this transformation has the same dimension as the number of nodes.
+        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, x, adj):
+        # x shape: (batch_size, num_nodes)
+        # adj shape: (num_nodes, num_nodes)
+
+        # Correct order of operations: (Â * X) * W
+        # 1. Aggregate features from neighbors (Â * X)
+        # To handle the batch, we compute Â * X^T and then transpose the result.
+        aggregated_features = torch.spmm(adj, x.t()).t()  # (N,N) @ (N,B) -> (N,B) -> (B,N)
+
+        # 2. Transform the aggregated features (result * W)
+        output = torch.mm(aggregated_features, self.weight)  # (B,N) @ (N, F_out) -> (B, F_out)
+
+        return output
+
+
+class GCNLSTMImputer(nn.Module):
+    def __init__(self, adj, num_nodes, in_features, gcn_hidden, lstm_hidden, out_features):
+        super(GCNLSTMImputer, self).__init__()
+        self.adj = adj
+        self.gcn = GraphConvolution(in_features, gcn_hidden)
+        self.lstm = nn.LSTM(gcn_hidden, lstm_hidden, batch_first=True)
+        self.fc = nn.Linear(lstm_hidden, out_features)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        # x shape: (batch_size, seq_len, num_nodes)
+        batch_size, seq_len, num_nodes = x.shape
+        gcn_outputs = []
+        for t in range(seq_len):
+            # Apply GCN at each time step
+            gcn_out = self.relu(self.gcn(x[:, t, :], self.adj))
+            gcn_outputs.append(gcn_out.unsqueeze(1))
+
+        # Concatenate GCN outputs along the sequence dimension
+        gcn_sequence = torch.cat(gcn_outputs, dim=1)  # (batch_size, seq_len, gcn_hidden)
+
+        # Feed sequence to LSTM
+        lstm_out, _ = self.lstm(gcn_sequence)  # (batch_size, seq_len, lstm_hidden)
+
+        # Pass LSTM output to the final fully connected layer
+        output = self.fc(lstm_out)  # (batch_size, seq_len, out_features) which is num_nodes
+
+        return output
+
+class SpatioTemporalDataset(Dataset):
+    def __init__(self, X, y, mask, seq_len=24):
+        self.X = torch.FloatTensor(X)
+        self.y = torch.FloatTensor(y)
+        self.mask = torch.FloatTensor(mask)
+        self.seq_len = seq_len
+
+    def __len__(self):
+        return len(self.X) - self.seq_len + 1
+
+    def __getitem__(self, idx):
+        return (
+            self.X[idx : idx + self.seq_len],
+            self.y[idx : idx + self.seq_len],
+            self.mask[idx : idx + self.seq_len],
+        )
+
+criterion = nn.MSELoss(reduction='none')
+
+def masked_loss(outputs, targets, mask):
+    loss = criterion(outputs, targets)
+    masked_loss = loss * mask
+    # We only want the average over the non-zero elements of the mask
+    return torch.sum(masked_loss) / torch.sum(mask)
 
 def plot_sliding_custom_chart(sliding_df, sstates, sensor_cols):
     fig = go.Figure()
@@ -79,57 +161,370 @@ def plot_sliding_custom_chart(sliding_df, sstates, sensor_cols):
 # -------------------------
 # Train GCN Model
 # -------------------------
-def train_model(train_file, positions_file, model_path='model.pth'):
-    if st.session_state.get('graph_size'):
-        graph_size = st.session_state['graph_size']
-    else:
-        graph_size = DEFAULT_VALUES["graph_size"]
+# def train_model(train_file, positions_file, model_path='model.pth'):
+#     if st.session_state.get('graph_size'):
+#         graph_size = st.session_state['graph_size']
+#     else:
+#         graph_size = DEFAULT_VALUES["graph_size"]
+#
+#     sensor_cols = train_file.columns[1:(graph_size + 1)]
+#
+#     # Build fake positions or use the real ones
+#     sensor_positions = {i: (i % 5, i // 5) for i in range(graph_size)}
+#     edge_index = helper.build_edge_index(sensor_positions)
+#     model = GraphConvolution(in_features=1,  out_features=1)
+#     #model = helper.TSGUARD(input_dim=1, hidden_dim=32, output_dim=1)
+#     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+#     loss_fn = nn.MSELoss()
+#     # Transpose to get features per sensor over time
+#     all_features = torch.tensor(train_file[sensor_cols].values.T, dtype=torch.float)  # Shape: [10 nodes, time_steps]
+#     progress_bar = st.progress(0)  # Initialize progress bar
+#     status_container = st.container()
+#     avg_loss =0.0 # Container to keep all updates
+#     model.train()
+#     for epoch in range(100):
+#         total_loss = 0.0
+#         for t in range(all_features.shape[1]):
+#             x = all_features[:, t].unsqueeze(1)
+#             y = x.clone()
+#             optimizer.zero_grad()
+#             out = model(x, edge_index)
+#             loss = loss_fn(out, y)
+#             loss.backward()
+#             optimizer.step()
+#             total_loss += loss.item()
+#         avg_loss += total_loss/all_features.shape[1]
+#
+#         progress = epoch + 1
+#         if progress % 10 == 0 or epoch == 0:
+#             loss_value = (total_loss / all_features.shape[1])
+#             print(f"Epoch {progress}, Loss: {loss_value:.4f}")
+#             progress_bar.progress(progress)
+#
+#             with status_container:
+#                 st.write(f"🔹 **Epoch {progress}** | 📉 **Loss:** `{loss_value:.4f}`")
+#
+#     torch.save(model.state_dict(), model_path)
+#     print("✅ Model saved to", model_path)
 
-    sensor_cols = train_file.columns[1:(graph_size + 1)]
+device = (
+    torch.device("cuda")
+    if torch.cuda.is_available()
+    else torch.device("mps")
+    if torch.backends.mps.is_available()
+    else torch.device("cpu")
+)
 
-    # Build fake positions or use the real ones
+def haversine_distance(lat1, lon1, lat2, lon2):
+    from math import radians, sin, cos, sqrt, atan2
+    R = 6371  # Radius of Earth in Km
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+
+    a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    distance = R * c
+    return distance
+
+def create_adjacency_matrix(latlng_df, threshold_type='gaussian', sigma_sq_ratio=0.1):
+    num_sensors = len(latlng_df)
+    dist_matrix = np.zeros((num_sensors, num_sensors))
+
+    for i in range(num_sensors):
+        for j in range(i, num_sensors):
+            lat1, lon1 = latlng_df.iloc[i]['latitude'], latlng_df.iloc[i]['longitude']
+            lat2, lon2 = latlng_df.iloc[j]['latitude'], latlng_df.iloc[j]['longitude']
+            dist = haversine_distance(lat1, lon1, lat2, lon2)
+            dist_matrix[i, j] = dist_matrix[j, i] = dist
+
+    if threshold_type == 'gaussian':
+        # Use a Gaussian kernel to compute weights
+        sigma_sq = dist_matrix.std()**2 * sigma_sq_ratio
+        adj_matrix = np.exp(-dist_matrix**2 / sigma_sq)
+    else: # Simple binary threshold
+        threshold = np.mean(dist_matrix) * 0.5
+        adj_matrix = (dist_matrix <= threshold).astype(float)
+
+    # Add self-loops
+    np.fill_diagonal(adj_matrix, 1)
+
+    # Symmetric normalization
+    D = np.diag(np.sum(adj_matrix, axis=1))
+    D_inv_sqrt = np.linalg.inv(np.sqrt(D))
+    adj_matrix_normalized = D_inv_sqrt @ adj_matrix @ D_inv_sqrt
+
+    return torch.FloatTensor(adj_matrix_normalized)
+
+
+def train_model(train_file, missing_file, positions_file, epochs, model_path):
+    import pandas as pd
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    import streamlit as st
+    from torch.utils.data import DataLoader
+    from io import BytesIO
+    import json
+
+    # ---- helpers ------------------------------------------------------------
+    def norm_id_colname(c: object) -> str:
+        """Normalize column names: keep 'datetime' as is; for all-digit names, zero-pad to 6."""
+        s = str(c).strip()
+        if s.lower() == "datetime":
+            return "datetime"
+        return s.zfill(6) if s.isdigit() else s
+
+    def norm_df_columns(df: pd.DataFrame) -> pd.DataFrame:
+        return df.rename(columns={c: norm_id_colname(c) for c in df.columns})
+
+    def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+        if "datetime" in df.columns:
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df = df.set_index("datetime")
+        return df
+
+    def load_positions_df(obj) -> pd.DataFrame:
+        """
+        Return DataFrame with columns: sensor_id, latitude, longitude.
+        If obj is a dict like {0:(lon,lat), ...}, we convert it.
+        """
+        if isinstance(obj, dict):
+            # dict assumed as {idx: (lon, lat)}
+            df = (pd.DataFrame.from_dict(obj, orient="index", columns=["longitude", "latitude"])
+                    .rename_axis("sensor_id").reset_index())
+        elif isinstance(obj, pd.DataFrame):
+            df = obj.copy()
+        elif hasattr(obj, "read"):  # Streamlit UploadedFile
+            raw = obj.read()
+            # try CSV first
+            try:
+                df = pd.read_csv(BytesIO(raw))
+            except Exception:
+                data = json.loads(raw.decode("utf-8"))
+                if isinstance(data, dict):
+                    df = (pd.DataFrame.from_dict(data, orient="index",
+                                                 columns=["longitude", "latitude"])
+                            .rename_axis("sensor_id").reset_index())
+                else:
+                    df = pd.DataFrame(data)
+        elif isinstance(obj, str):
+            # path
+            try:
+                df = pd.read_csv(obj)
+            except Exception:
+                with open(obj, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    df = (pd.DataFrame.from_dict(data, orient="index",
+                                                 columns=["longitude", "latitude"])
+                            .rename_axis("sensor_id").reset_index())
+                else:
+                    df = pd.DataFrame(data)
+        else:
+            raise TypeError("positions_file must be dict, DataFrame, path, or file-like.")
+
+        # normalize column names and aliases
+        df.columns = [c.strip().lower() for c in df.columns]
+        df = df.rename(columns={"lon": "longitude", "lng": "longitude", "lat": "latitude"})
+        if "sensor_id" not in df.columns:
+            df = df.reset_index().rename(columns={"index": "sensor_id"})
+
+        required = {"sensor_id", "latitude", "longitude"}
+        if not required.issubset(df.columns):
+            raise ValueError(f"Positions file must contain {required}. Found: {list(df.columns)}")
+
+        # Don't force zero-padding yet; we may need to remap 0..N-1 to real IDs later.
+        df["sensor_id"] = df["sensor_id"].astype(str).str.strip()
+        return df[["sensor_id", "latitude", "longitude"]]
+
+    def remap_positions_ids_if_indexed(latlng: pd.DataFrame, ground_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        If positions have sensor_id like '0','1',...,'N-1', remap them to the actual sensor
+        column names from ground_df (e.g., '001001'...'001036') preserving order.
+        """
+        # columns present in ground_df (already normalized later)
+        gcols = [c for c in ground_df.columns]
+        # positions ids that look like integers 0..N-1
+        if latlng["sensor_id"].str.fullmatch(r"\d+").all():
+            ids = latlng["sensor_id"].astype(int)
+            if ids.min() == 0 and ids.max() == len(latlng) - 1:
+                # sort by the numeric id to ensure consistent order
+                latlng = latlng.sort_values("sensor_id", key=lambda s: s.astype(int)).reset_index(drop=True)
+                # map to ground_df columns by order
+                if len(gcols) < len(latlng):
+                    raise ValueError(
+                        f"Positions rows ({len(latlng)}) exceed available sensor columns in ground_df ({len(gcols)})."
+                    )
+                latlng["sensor_id"] = gcols[:len(latlng)]
+        else:
+            # if already like '001001', leave as-is but normalize to 6-digit digit-only when appropriate
+            latlng["sensor_id"] = latlng["sensor_id"].apply(
+                lambda s: s if not s.isdigit() else s.zfill(6)
+            )
+        return latlng
+
+    # ---- graph size & edges -------------------------------------------------
+    graph_size = st.session_state.get('graph_size', DEFAULT_VALUES["graph_size"])
     sensor_positions = {i: (i % 5, i // 5) for i in range(graph_size)}
     edge_index = helper.build_edge_index(sensor_positions)
 
-    model = helper.TSGUARD(input_dim=1, hidden_dim=32, output_dim=1)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    loss_fn = nn.MSELoss()
+    # ---- load / normalize inputs -------------------------------------------
+    # Expect train_file & missing_file already as DataFrames (from your Streamlit pipeline)
+    ground_df = train_file.copy()
+    missing_df = missing_file.copy()
 
-    # Transpose to get features per sensor over time
-    all_features = torch.tensor(train_file[sensor_cols].values.T, dtype=torch.float)  # Shape: [10 nodes, time_steps]
+    # Normalize column names: keep datetime, zero-pad purely digit names
+    ground_df = norm_df_columns(ground_df)
+    missing_df = norm_df_columns(missing_df)
 
-    progress_bar = st.progress(0)  # Initialize progress bar
-    status_container = st.container()  # Container to keep all updates
+    # Ensure datetime index
+    ground_df = ensure_datetime_index(ground_df)
+    missing_df = ensure_datetime_index(missing_df)
 
-    for epoch in range(100):
-        total_loss = 0
-        for t in range(all_features.shape[1]):
-            x = all_features[:, t].unsqueeze(1)  # Shape: [10 nodes, 1 feature]
-            y = x.clone()
+    # Load and normalize positions
+    latlng = load_positions_df(positions_file)  # columns: sensor_id, latitude, longitude
+    # If positions are 0..N-1, remap to actual sensor names from ground_df
+    latlng = remap_positions_ids_if_indexed(latlng, ground_df)
 
-            model.train()
+    # Final normalization: ensure positions IDs match ground/missing style (zero-padded if digits)
+    latlng["sensor_id"] = latlng["sensor_id"].apply(lambda s: s if not s.isdigit() else s.zfill(6))
+
+    # ---- align columns ------------------------------------------------------
+    sensor_cols = latlng["sensor_id"].tolist()  # e.g., ['001001', '001002', ...]
+    # Sanity checks
+    missing_in_ground = sorted(set(sensor_cols) - set(map(str, ground_df.columns)))
+    missing_in_missing = sorted(set(sensor_cols) - set(map(str, missing_df.columns)))
+    if missing_in_ground or missing_in_missing:
+        raise KeyError(
+            "Some expected sensor columns are missing.\n"
+            f"- Missing in ground_df: {missing_in_ground}\n"
+            f"- Missing in missing_df: {missing_in_missing}\n"
+            f"- Sample ground_df columns: {list(ground_df.columns)[:8]}"
+        )
+
+    # Reindex columns to the exact order from positions
+    ground_df = ground_df[sensor_cols]
+    missing_df = missing_df[sensor_cols]
+    # remove duplicate timestamps if any
+    ground_df = ground_df[~ground_df.index.duplicated(keep="first")]
+    missing_df = missing_df[~missing_df.index.duplicated(keep="first")]
+
+    # keep only the timestamps present in BOTH
+    common_index = ground_df.index.intersection(missing_df.index)
+
+    if len(common_index) == 0:
+        raise ValueError(
+            "No overlapping timestamps between ground and missing data. "
+            f"ground_df span: {ground_df.index.min()} -> {ground_df.index.max()}, "
+            f"missing_df span: {missing_df.index.min()} -> {missing_df.index.max()}"
+        )
+
+    # align & sort
+
+    ground_df = ground_df.loc[common_index].sort_index()
+    missing_df = missing_df.loc[common_index].sort_index()
+
+    # safety checks
+    train_month_list = [1, 2, 4, 5, 7, 8, 10, 11]
+    SEQ_LEN = 24
+    if len(common_index) < 2 * SEQ_LEN:
+        raise ValueError(f"Not enough overlapping timestamps after alignment: {len(common_index)} rows.")
+    if not np.any(np.isin(missing_df.index.month, train_month_list)):
+        raise ValueError("Train split is empty. Check your train_month_list or the data's date range.")
+
+    # ---- numpy conversion & simple imputation -------------------------------
+    ground_data = ground_df.to_numpy(dtype=np.float32)
+    missing_data = missing_df.to_numpy(dtype=np.float32)
+
+    # simple ffill/bfill for model inputs; evaluation still compares to ground_data
+    imputed_df = missing_df.fillna(method='ffill').fillna(method='bfill')
+    imputed_data = imputed_df.to_numpy(dtype=np.float32)
+
+    # ---- adjacency & model --------------------------------------------------
+    adj_matrix = create_adjacency_matrix(latlng, sigma_sq_ratio=0.1)
+
+    NUM_NODES = missing_data.shape[1]
+    GCN_HIDDEN = 64
+    LSTM_HIDDEN = 64
+
+    model = GCNLSTMImputer(
+        adj=adj_matrix.to(device),
+        num_nodes=NUM_NODES,
+        in_features=NUM_NODES,
+        gcn_hidden=GCN_HIDDEN,
+        lstm_hidden=LSTM_HIDDEN,
+        out_features=NUM_NODES
+    ).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=0.1)
+
+    # ---- split, scaling -----------------------------------------------------
+
+    months = missing_df.index.month
+
+    # mask where we have ground truth for NaNs in missing_data
+    loss_mask = np.where(np.isnan(missing_data) & ~np.isnan(ground_data), 1.0, 0.0).astype(np.float32)
+    train_slice = np.isin(months, train_month_list)
+
+    train_imputed_data = imputed_data[train_slice]
+    min_val = np.nanmin(train_imputed_data)
+    max_val = np.nanmax(train_imputed_data)
+    denom = (max_val - min_val) if (max_val - min_val) != 0 else 1.0
+    scaler = lambda x: (x - min_val) / denom
+    inv_scaler = lambda x: x * denom + min_val
+    scaler_params = {'min_val': float(min_val), 'max_val': float(max_val)}
+
+    imputed_data_normalized = scaler(imputed_data)
+    ground_data_normalized = scaler(ground_data)
+    ground_data_normalized = np.nan_to_num(ground_data_normalized, nan=0.0)
+
+    X_train = imputed_data_normalized[train_slice]
+    y_train = ground_data_normalized[train_slice]
+    mask_train = loss_mask[train_slice]
+
+
+    BATCH_SIZE = 32
+    train_dataset = SpatioTemporalDataset(X_train, y_train, mask_train, seq_len=SEQ_LEN)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+
+    # ---- training loop ------------------------------------------------------
+    progress_bar = st.progress(0.0)
+    status_container = st.container()
+
+    avg_train_loss = 0.0
+    model.train()
+    for epoch in range(epochs):
+        total_train_loss = 0.0
+        num_batches = 0
+
+        for inputs, targets, mask in train_loader:
+            inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
             optimizer.zero_grad()
-            out = model(x, edge_index)
-            loss = loss_fn(out, y)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+            outputs = model(inputs)
+            loss = masked_loss(outputs, targets, mask)
+            if not torch.isnan(loss) and torch.sum(mask) > 0:
+                loss.backward()
+                optimizer.step()
+                total_train_loss += loss.item()
+                num_batches += 1
 
-        progress = epoch + 1
-        if progress % 10 == 0 or epoch == 0:
-            loss_value = (total_loss / all_features.shape[1])
-            print(f"Epoch {progress}, Loss: {loss_value:.4f}")
-            progress_bar.progress(progress)
+        epoch_loss = (total_train_loss / max(num_batches, 1))
+        avg_train_loss += epoch_loss
 
+        progress_bar.progress(int((epoch + 1) * 100 / max(epochs, 1)))
+        if (epoch + 1) % 10 == 0 or epoch == 0:
             with status_container:
-                st.write(f"🔹 **Epoch {progress}** | 📉 **Loss:** `{loss_value:.4f}`")
+                st.write(f"🔹 **Epoch {epoch + 1}** | 📉 **Loss:** `{epoch_loss:.4f}`")
 
-    torch.save(model.state_dict(), model_path)
-    print("✅ Model saved to", model_path)
+    avg_train_loss /= max(epochs, 1)
 
-
-
-
+    # ---- save model ---------------------------------------------------------
+    MODEL_SAVE_PATH = model_path if model_path else "gcn_lstm_imputer.pth"
+    torch.save(model.state_dict(), MODEL_SAVE_PATH)
+    print(f"Epoch {epoch + 1}/{epochs} | Train Loss: {avg_train_loss:.6f}")
 
 
 def draw_full_time_series(global_df, sim_file, sensor_cols, sensor_color_map):

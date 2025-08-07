@@ -51,7 +51,7 @@ def main():
         st.title("⏳ Training is running... Please wait.")
         with st.spinner("Training GNN model..."):
             model_path = DEFAULT_VALUES["training_file_path"]
-            sim.train_model(tr, pf, model_path=model_path)
+            sim.train_model(tr,df, pf, 10, model_path=model_path)
             st.markdown("<hr style='border: 1px solid #ccc;'>", unsafe_allow_html=True)
             st.success(f"✅ Training completed. Model saved to '`{model_path}`'")
             st.session_state.training = False
