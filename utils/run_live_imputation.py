@@ -95,7 +95,13 @@ def run_live_imputation(
     if not all(os.path.exists(p) for p in [model_path, missing_csv_path, latlng_path, scaler_params_path]):
         raise FileNotFoundError("One or more required input files are missing.")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = (
+        torch.device("cuda")
+        if torch.cuda.is_available()
+        else torch.device("mps")
+        if torch.backends.mps.is_available()
+        else torch.device("cpu")
+    )
 
     # Load coordinates and determine sensor order
     latlng_df = pd.read_csv(latlng_path)

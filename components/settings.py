@@ -103,7 +103,7 @@ def add_threshold_panel():
     st.markdown("The default value is **" + str(DEFAULT_VALUES["sigma_threshold"]) + " minutes**.")
     col1, col2 = st.columns([2, 1])
     with col1:
-        threshold = st.number_input("📈 Threshold Value", value=DEFAULT_VALUES["sigma_threshold"], step=1, key="threshold")
+        threshold = st.number_input("📈 Threshold Value Delay", value=DEFAULT_VALUES["sigma_threshold"], step=1, key="threshold")
     with col2:
         time_unit = st.selectbox("Unit", ["minutes", "hours"], key="time_unit")
     if st.button("Set the delay threshold", key="set_sigma_threshold"):

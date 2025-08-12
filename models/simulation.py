@@ -2,8 +2,6 @@ import json
 import time
 import torch
 import torch.nn as nn
-import pandas as pd
-import numpy as np
 from torch import optim
 from torch.utils.data import DataLoader, Dataset
 import models.sim_helper as helper
@@ -14,7 +12,95 @@ from utils.visualization import draw_graph, draw_dashboard
 from utils.config import DEFAULT_VALUES
 import time
 import helpers as Help
+import pydeck as pdk
+import plotly.graph_objects as go
+import pandas as pd
+import numpy as np
 
+SENSOR_SYMBOL = "circle"  # valid Scattermapbox symbol
+
+def init_sensor_map(latlng_df):
+    center_lat = float(latlng_df["latitude"].mean()) if len(latlng_df) else 0.0
+    center_lon = float(latlng_df["longitude"].mean()) if len(latlng_df) else 0.0
+
+    lats = latlng_df["latitude"].astype(float).tolist()
+    lons = latlng_df["longitude"].astype(float).tolist()
+
+    fig = go.Figure(go.Scattermapbox(
+        lat=lats,
+        lon=lons,
+        mode="markers+text",
+        text=[""] * len(lats),
+        marker=dict(size=18, opacity=0.95, color=["#2ecc71"] * len(lats), symbol="circle"),
+        customdata=[[str(sid), "NA", "Imputed"] for sid in latlng_df["sensor_id"].astype(str)],
+        hovertemplate="<b>Sensor</b>: %{customdata[0]}<br>"
+                      "<b>Value</b>: %{customdata[1]}<br>"
+                      "<b>Status</b>: %{customdata[2]}<extra></extra>",
+        name="Sensors"
+    ))
+
+    fig.update_layout(
+        mapbox=dict(
+            style="carto-positron",             # English labels
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=11
+        ),
+        uirevision="keep",                      # keep camera + UI state
+        transition=dict(duration=0),            # no animation
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=480,
+        showlegend=False,
+    )
+    return fig
+
+
+def positions_to_df(positions):
+    if isinstance(positions, pd.DataFrame):
+        df = positions.rename(columns={"lat": "latitude", "lng": "longitude", "lon": "longitude"}).copy()
+        if "sensor_id" not in df.columns:
+            df = df.reset_index().rename(columns={"index": "sensor_id"})
+        return df[["sensor_id", "latitude", "longitude"]]
+    rows = [{"sensor_id": str(k), "latitude": float(v[1]), "longitude": float(v[0])}
+            for k, v in positions.items()]
+    return pd.DataFrame(rows, columns=["sensor_id", "latitude", "longitude"])
+
+
+def make_sensor_map_plotly(latlng_df, values_by_sensor, is_real_by_sensor):
+    """Scattermapbox: green=real, red=imputed."""
+    lats, lons, colors, texts = [], [], [], []
+    for _, r in latlng_df.iterrows():
+        sid = str(r["sensor_id"])
+        val = values_by_sensor.get(sid)
+        real = bool(is_real_by_sensor.get(sid, False))
+        lats.append(float(r["latitude"]))
+        lons.append(float(r["longitude"]))
+        colors.append("green" if real else "red")
+        texts.append(f"<b>Sensor</b>: {sid}<br><b>Value</b>: {val if val is not None else 'NA'}"
+                     f"<br><b>Status</b>: {'Real' if real else 'Imputed'}")
+
+    fig = go.Figure(go.Scattermapbox(
+        lat=lats, lon=lons, mode="markers+text",
+        marker=dict(size=14, color=colors, opacity=0.90),
+        text=[values_by_sensor.get(str(sid), "") for sid in latlng_df["sensor_id"]],
+        textposition="top center",
+        hovertext=texts, hoverinfo="text",
+        name="Sensors"
+    ))
+
+    if len(latlng_df):
+        center_lat = float(latlng_df["latitude"].mean())
+        center_lon = float(latlng_df["longitude"].mean())
+    else:
+        center_lat, center_lon = 0.0, 0.0
+
+    fig.update_layout(
+        mapbox=dict(style="open-street-map", center=dict(lat=center_lat, lon=center_lon), zoom=11),
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=480,
+        showlegend=False,
+        title=None,
+    )
+    return fig
 
 class GraphConvolution(nn.Module):
     def __init__(self, in_features, out_features):
@@ -624,27 +710,46 @@ def draw_gauge_figure(sim_file, current_time, sensor_cols):
     return gauge_fig
 
 def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_placeholder, gauge_placeholder):
-    if st.session_state.get('graph_size'):
-        graph_size = st.session_state['graph_size']
-    else:
-        graph_size = DEFAULT_VALUES["graph_size"]
-
+    # 1) graph size & columns
+    graph_size = st.session_state.get('graph_size', DEFAULT_VALUES["graph_size"])
     sensor_cols = sim_file.columns[1:(graph_size + 1)]
 
+    # 2) align times / indexes
     imputed_df = pd.read_csv("pm25_imputed_live.csv")
     imputed_df["datetime"] = pd.to_datetime(imputed_df["datetime"], errors="coerce")
-    sim_file["datetime"] = pd.to_datetime(sim_file["datetime"], errors="coerce")
-
-    imputed_df["datetime"] = imputed_df["datetime"].dt.floor("H")
-    sim_file["datetime"] = sim_file["datetime"].dt.floor("H")
-
+    sim_file["datetime"]    = pd.to_datetime(sim_file["datetime"], errors="coerce")
+    imputed_df["datetime"]  = imputed_df["datetime"].dt.floor("h")
+    sim_file["datetime"]    = sim_file["datetime"].dt.floor("h")
     imputed_df.set_index("datetime", inplace=True)
     sim_file.set_index("datetime", inplace=True)
 
-    st.subheader("Sensor Simulation Graph")
-    graph_placeholder = st.empty()
-    time_placeholder = st.empty()
+    # 3) header + map in one container (title/time above the map)
+    map_container = st.container()
+    with map_container:
+        title_slot = st.markdown("### Sensor Simulation Graph")
+        time_slot  = st.empty()
+        map_placeholder = st.empty()
 
+    # 4) positions (once)
+    latlng = positions_to_df(positions).copy()
+    latlng["latitude"]  = pd.to_numeric(latlng["latitude"], errors="coerce")
+    latlng["longitude"] = pd.to_numeric(latlng["longitude"], errors="coerce")
+    sid_order = [str(s) for s in latlng["sensor_id"].tolist()]
+
+    # 5) init map once
+    if "sensor_map_fig" not in st.session_state:
+        st.session_state.sensor_map_fig = init_sensor_map(latlng)
+
+    # throttle map renders (~5 fps)
+    if "last_map_render" not in st.session_state:
+        st.session_state.last_map_render = 0.0
+    MIN_INTERVAL = 0.30
+
+    # cache last payload to avoid redundant renders
+    if "last_map_payload" not in st.session_state:
+        st.session_state.last_map_payload = None
+
+    # 6) layout below the map
     st.markdown("---")
     line3_col1, line3_col2 = st.columns([2, 2])
     with line3_col1:
@@ -658,16 +763,24 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
     st.subheader("Missed Data (%)")
     gauge_placeholder = st.empty()
 
+    # 7) buffers for charts
     sliding_window_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
     global_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
 
+    # palette for time-series lines
     sensor_custom_colors = [
         "#000000", "#003366", "#009999", "#006600", "#66CC66",
         "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"
     ]
     sensor_color_map = {col: sensor_custom_colors[i % len(sensor_custom_colors)] for i, col in enumerate(sensor_cols)}
 
+    # static mapping from data columns to map sensor IDs (same order)
+    col_to_sid = {col: sid_order[i] for i, col in enumerate(sensor_cols)}
+
+
+    # 8) main loop (single loop only)
     for current_time, row in sim_file.iterrows():
+        # (optional) skip limits / exact hour as you had
         if current_time >= pd.Timestamp("2014-05-09 09:00:00"):
             break
         if current_time.time().strftime("%H:%M:%S") == "00:00:00":
@@ -675,44 +788,86 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
         if current_time not in imputed_df.index:
             continue
 
+        # --- build svals / sstates FIRST ---
         imputed_row = imputed_df.loc[current_time]
         svals, sstates = [], []
-
         for col in sensor_cols:
             val = row[col]
-            imputed_col = col.lstrip("0")
+            imputed_col = col.lstrip("0")  # mapping used in your data
             if pd.isna(val):
-                imputed_val = imputed_row.get(imputed_col)
-                svals.append(imputed_val)
-                sstates.append(False)
-                print(f"[IMPUTED] Time: {current_time}, Sensor: {col} (-> {imputed_col}), Value: {imputed_val}")
+                svals.append(imputed_row.get(imputed_col))
+                sstates.append(False)   # imputed
             else:
                 svals.append(val)
-                sstates.append(True)
+                sstates.append(True)    # real
 
-        svals = (svals + [None] * graph_size)[:graph_size]
+        # enforce size
+        svals   = (svals + [None] * graph_size)[:graph_size]
         sstates = (sstates + [False] * graph_size)[:graph_size]
 
+        # append to buffers for time-series figures
         row_data = {"datetime": current_time}
         for i, col in enumerate(sensor_cols):
             row_data[col] = svals[i]
-
         sliding_window_df = pd.concat([sliding_window_df, pd.DataFrame([row_data])], ignore_index=True)
-        global_df = pd.concat([global_df, pd.DataFrame([row_data])], ignore_index=True)
-
+        global_df        = pd.concat([global_df,        pd.DataFrame([row_data])], ignore_index=True)
         if len(sliding_window_df) > graph_size:
             sliding_window_df = sliding_window_df.tail(graph_size)
 
-        fig = draw_graph(graph_size, svals, sstates, positions, current_time)
-        time_placeholder.write(f"**Current Time**: {current_time}")
-        graph_placeholder.plotly_chart(fig, use_container_width=True, key=f"graph_{current_time}")
+        # Build values/states keyed by columns
+        vals_by_col = {col: (svals[i] if i < len(svals) else None) for i, col in enumerate(sensor_cols)}
+        real_by_col = {col: (sstates[i] if i < len(sstates) else False) for i, col in enumerate(sensor_cols)}
 
+        # Column -> SID mapping (precomputed above as col_to_sid)
+        vals_by_sid = {col_to_sid[col]: vals_by_col[col] for col in sensor_cols if col in col_to_sid}
+        real_by_sid = {col_to_sid[col]: real_by_col[col] for col in sensor_cols if col in col_to_sid}
+
+        # Pack customdata rows (sid, value, status)
+        customdata = [
+            [sid, vals_by_sid.get(sid, "NA"), "Real" if real_by_sid.get(sid, False) else "Imputed"]
+            for sid in sid_order
+        ]
+        colors = ["#2ecc71" if row[2] == "Real" else "#e74c3c" for row in customdata]
+
+        fig = st.session_state.sensor_map_fig
+        if not fig.data:
+            fig.add_trace(go.Scattermapbox(mode="markers+text"))
+
+        tr = fig.data[0]
+
+        # ⚠️ ONLY these two lines change every tick:
+        tr.customdata = customdata
+        tr.marker.color = colors
+
+        # Throttle + render when changed
+        payload = (tuple(colors), tuple((row[1], row[2]) for row in customdata))
+        now = time.time()
+        should_render = (
+                payload != st.session_state.last_map_payload
+                and (now - st.session_state.last_map_render) >= MIN_INTERVAL
+        )
+        if should_render:
+            time_slot.markdown(f"**Current Time:** {current_time}")
+            map_placeholder.plotly_chart(
+                fig,
+                use_container_width=True,
+                config={"displayModeBar": False}
+            )
+            st.session_state.last_map_render = now
+            st.session_state.last_map_payload = payload
+
+        if now - st.session_state.last_map_render >= MIN_INTERVAL:
+            time_slot.markdown(f"**Current Time:** {current_time}")
+            map_placeholder.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+        # ---- Sliding window (10-step) chart ----
         sstate_by_col = {}
         for col in sensor_cols:
             sstate_by_col[col] = []
             for j in range(len(sliding_window_df)):
-                timestamp = sliding_window_df.iloc[j]["datetime"]
-                real = not pd.isna(sim_file.loc[timestamp, col]) if timestamp in sim_file.index else False
+                ts = sliding_window_df.iloc[j]["datetime"]
+                real = not pd.isna(sim_file.loc[ts, col]) if ts in sim_file.index else False
                 sstate_by_col[col].append(real)
 
         sliding_fig = go.Figure()
@@ -723,70 +878,49 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
             states = sstate_by_col[col]
 
             segment_x, segment_y, segment_state = [], [], []
-
             for x, y, state in zip(x_vals, y_vals, states):
                 if pd.isna(y):
                     continue
-                segment_x.append(x)
-                segment_y.append(y)
-                segment_state.append(state)
-
+                segment_x.append(x); segment_y.append(y); segment_state.append(state)
                 if len(segment_x) >= 2:
-                    is_imputed_segment = any(not s for s in segment_state)
-                    seg_color = "red" if is_imputed_segment else color
-
+                    seg_color = "red" if any(not s for s in segment_state) else color
                     sliding_fig.add_trace(go.Scatter(
-                        x=segment_x,
-                        y=segment_y,
-                        mode="lines+markers",
+                        x=segment_x, y=segment_y, mode="lines+markers",
                         name=f"Sensor {col}",
-                        line=dict(color=seg_color),
-                        marker=dict(size=6, color=seg_color),
+                        line=dict(color=seg_color), marker=dict(size=6, color=seg_color),
                         showlegend=False
                     ))
-                    segment_x = [segment_x[-1]]
-                    segment_y = [segment_y[-1]]
-                    segment_state = [segment_state[-1]]
+                    segment_x, segment_y, segment_state = [segment_x[-1]], [segment_y[-1]], [segment_state[-1]]
 
             if len(segment_x) >= 2:
-                seg_color = "red" if any(s == False for s in segment_state) else color
+                seg_color = "red" if any(s is False for s in segment_state) else color
                 sliding_fig.add_trace(go.Scatter(
-                    x=segment_x,
-                    y=segment_y,
-                    mode="lines+markers",
+                    x=segment_x, y=segment_y, mode="lines+markers",
                     name=f"Sensor {col}",
-                    line=dict(color=seg_color),
-                    marker=dict(size=6, color=seg_color),
+                    line=dict(color=seg_color), marker=dict(size=6, color=seg_color),
                     showlegend=False
                 ))
 
         for col in sensor_cols:
             sliding_fig.add_trace(go.Scatter(
-                x=[None], y=[None],
-                mode='markers',
+                x=[None], y=[None], mode='markers',
                 marker=dict(size=8, color=sensor_color_map[col]),
-                legendgroup=col,
-                showlegend=True,
-                name=f"Sensor {col}"
+                legendgroup=col, showlegend=True, name=f"Sensor {col}"
             ))
         sliding_fig.add_trace(go.Scatter(
-            x=[None], y=[None],
-            mode='markers',
+            x=[None], y=[None], mode='markers',
             marker=dict(size=8, color="red"),
-            legendgroup="imputed",
-            showlegend=True,
-            name="Imputed Segment"
+            legendgroup="imputed", showlegend=True, name="Imputed Segment"
         ))
-
         sliding_fig.update_layout(
             title="10-Step Snapshot",
-            xaxis_title="Time",
-            yaxis_title="Sensor Value",
+            xaxis_title="Time", yaxis_title="Sensor Value",
             margin=dict(l=20, r=20, t=40, b=20),
             legend_title="Sensors"
         )
         sliding_chart_placeholder.plotly_chart(sliding_fig, use_container_width=True, key=f"sliding_{current_time}")
 
+        # ---- Global time series + Gauge ----
         full_ts_fig = draw_full_time_series(global_df.copy(), sim_file, sensor_cols, sensor_color_map)
         with line3_col1:
             global_dashboard_placeholder.plotly_chart(full_ts_fig, use_container_width=True, key=f"global_{current_time}")
