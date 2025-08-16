@@ -17,12 +17,28 @@ import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 
+import base64
+from pathlib import Path
 
+import base64
+from pathlib import Path
 
+def get_base64_icon(path):
+    icon_bytes = Path(path).read_bytes()
+    b64_str = base64.b64encode(icon_bytes).decode()
+    return f"data:image/png;base64,{b64_str}"
 
+# --- Icon spec (centered) ---
+ICON_URL = get_base64_icon("images/captor_icon.png")  # you already have this helper
 
-SENSOR_SYMBOL = "circle"  # valid Scattermapbox symbol
-
+ICON_W, ICON_H = 128, 128  # keep high-res for crispness
+ICON_SPEC = {
+    "url": ICON_URL,
+    "width": ICON_W,
+    "height": ICON_H,
+    "anchorX": ICON_W // 2,   # center the icon at the point
+    "anchorY": ICON_H // 2
+}
 def init_sensor_map(latlng_df):
     center_lat = float(latlng_df["latitude"].mean()) if len(latlng_df) else 0.0
     center_lon = float(latlng_df["longitude"].mean()) if len(latlng_df) else 0.0
@@ -35,7 +51,7 @@ def init_sensor_map(latlng_df):
         lon=lons,
         mode="markers+text",
         text=[""] * len(lats),
-        marker=dict(size=18, opacity=0.95, color=["#2ecc71"] * len(lats), symbol="circle"),
+        marker=dict(size=36, opacity=0.1, color=["#2ecc71"] * len(lats), symbol="circle"),
         customdata=[[str(sid), "NA", "Imputed"] for sid in latlng_df["sensor_id"].astype(str)],
         hovertemplate="<b>Sensor</b>: %{customdata[0]}<br>"
                       "<b>Value</b>: %{customdata[1]}<br>"
@@ -438,6 +454,8 @@ def train_model(train_file, missing_file, positions_file, epochs, model_path):
         # columns present in ground_df (already normalized later)
         gcols = [c for c in ground_df.columns]
         # positions ids that look like integers 0..N-1
+        print(latlng.head())
+        print(latlng.dtypes)
         if latlng["sensor_id"].str.fullmatch(r"\d+").all():
             ids = latlng["sensor_id"].astype(int)
             if ids.min() == 0 and ids.max() == len(latlng) - 1:
@@ -715,64 +733,148 @@ def draw_gauge_figure(sim_file, current_time, sensor_cols):
     return gauge_fig
 
 def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_placeholder, gauge_placeholder):
-    import pydeck as pdk
     import math
+    import base64
+    from pathlib import Path
+    import pydeck as pdk
 
-    # ----------------------------
-    # Small helpers (local to this function)
-    # ----------------------------
-    GREEN = [46, 204, 113]   # Real
-    RED   = [231, 76, 60]    # Imputed
+    # -------------------- petites utils locales --------------------
+    GREEN = [46, 204, 113, 190]   # RGBA (halo vert)
+    RED   = [231, 76, 60, 190]    # RGBA (halo rouge)
 
-    def compute_initial_view(latlng_df, padding_deg=0.02):
-        """Compute a deck.gl ViewState that covers all sensors."""
-        if latlng_df.empty:
-            return pdk.ViewState(latitude=0, longitude=0, zoom=2)
-        lat_min = float(latlng_df["latitude"].min())
-        lat_max = float(latlng_df["latitude"].max())
-        lon_min = float(latlng_df["longitude"].min())
-        lon_max = float(latlng_df["longitude"].max())
-        lat_c = (lat_min + lat_max) / 2.0
-        lon_c = (lon_min + lon_max) / 2.0
-        span = max(lat_max - lat_min, lon_max - lon_min) + padding_deg
-        span = max(span, 1e-3)
-        zoom = max(1.0, min(16.0, math.log2(360.0 / span)))
-        return pdk.ViewState(latitude=lat_c, longitude=lon_c, zoom=zoom, pitch=0, bearing=0)
-
-    def make_layer(sensor_df):
-        """Build ScatterplotLayer from a dataframe with columns:
-           ['sensor_id','latitude','longitude','value','status','color']"""
-        return pdk.Layer(
-            "ScatterplotLayer",
-            data=sensor_df,
-            get_position=["longitude", "latitude"],
-            get_fill_color="color",
-            get_radius=60,                # adjust to taste (meters)
-            radius_min_pixels=3,
-            radius_max_pixels=12,
-            pickable=True,
-            stroked=True,
-            get_line_color=[30, 30, 30],
-            line_width_min_pixels=1,
-        )
-
-    def make_tooltip():
+    def b64_icon_spec(path: str):
+        """Construit un ICON_SPEC centré pour IconLayer à partir d'un PNG local."""
+        b = Path(path).read_bytes()
+        b64 = base64.b64encode(b).decode()
         return {
-            "html": "<b>Sensor:</b> {sensor_id}<br>"
-                    "<b>Value:</b> {value}<br>"
-                    "<b>Status:</b> {status}",
-            "style": {"backgroundColor": "white", "color": "black"}
+            "url": f"data:image/png;base64,{b64}",
+            "width": 128,      # taille source image (px)
+            "height": 128,
+            "anchorX": 64,     # centre l’icône (X = width/2)
+            "anchorY": 64,     # centre l’icône (Y = height/2)
         }
 
-    # ----------------------------
-    # 1) graph size & columns
-    # ----------------------------
-    graph_size = st.session_state.get('graph_size', DEFAULT_VALUES["graph_size"])
-    sensor_cols = sim_file.columns[1:(graph_size + 1)]
+    ICON_SPEC = b64_icon_spec("images/captor_icon.png")
 
-    # ----------------------------
-    # 2) align times / indexes
-    # ----------------------------
+    def make_bg_layer(df):
+        # halo circulaire derrière l’icône (couleur = état capteur)
+        return pdk.Layer(
+            "ScatterplotLayer",
+            data=df,
+            get_position=["longitude", "latitude"],
+            get_fill_color="bg_color",
+            get_radius="bg_radius",
+            radius_scale=1,
+            radius_min_pixels=10,
+            radius_max_pixels=30,
+            stroked=True,
+            get_line_color=[255, 255, 255, 200],
+            line_width_min_pixels=1,
+            pickable=False,
+        )
+
+    def make_icon_layer(df):
+        # icône PNG centrée ; size_scale règle l’échelle globale (modulable via 'icon_size' par point)
+        return pdk.Layer(
+            "IconLayer",
+            data=df,
+            get_icon="icon",                    # chaque ligne contient un dict ICON_SPEC
+            get_position=["longitude", "latitude"],
+            get_size="icon_size",               # facteur par point (float)
+            size_scale=8,                       # échelle globale (augmente/diminue la taille visuelle)
+            size_min_pixels=14,
+            size_max_pixels=42,
+            pickable=True,
+        )
+
+    def fit_view(latlng_df, pad_deg=0.02):
+        if latlng_df.empty:
+            return pdk.ViewState(latitude=0, longitude=0, zoom=2)
+        lat_min, lat_max = float(latlng_df["latitude"].min()), float(latlng_df["latitude"].max())
+        lon_min, lon_max = float(latlng_df["longitude"].min()), float(latlng_df["longitude"].max())
+        lat_c = (lat_min + lat_max) / 2.0
+        lon_c = (lon_min + lon_max) / 2.0
+        span = max(lat_max - lat_min, lon_max - lon_min) + pad_deg
+        span = max(span, 1e-3)
+        zoom = max(2.0, min(16.0, math.log2(360.0 / span)))
+        return pdk.ViewState(latitude=lat_c, longitude=lon_c, zoom=zoom, pitch=0, bearing=0)
+
+    def zpad6(s: str) -> str:
+        return s if not s.isdigit() else s.zfill(6)
+
+    def strip0(s: str) -> str:
+        t = s.lstrip("0")
+        return t if t else "0"
+
+    # -------------------- 0) paramètres utilisateur --------------------
+    graph_size = int(st.session_state.get("graph_size", DEFAULT_VALUES["graph_size"]))
+    all_sensor_cols = list(sim_file.columns[1:])              # skip 'datetime'
+    sensor_cols = all_sensor_cols[:graph_size]                # limite au choix utilisateur
+    sensor_cols_str = [str(c).strip() for c in sensor_cols]   # noms en str
+
+    # -------------------- 1) positions : normaliser & aligner --------------------
+    latlng_raw = positions_to_df(positions).copy()
+    latlng_raw["sensor_id"] = latlng_raw["sensor_id"].astype(str).str.strip()
+    latlng_raw["latitude"]  = pd.to_numeric(latlng_raw["latitude"],  errors="coerce")
+    latlng_raw["longitude"] = pd.to_numeric(latlng_raw["longitude"], errors="coerce")
+    latlng_raw = latlng_raw.dropna(subset=["latitude", "longitude"])
+
+    pos_ids = latlng_raw["sensor_id"].tolist()
+
+    # candidats de mappage positions.sensor_id -> colonne data
+    # 1) exact
+    map_exact = {pid: pid for pid in pos_ids if pid in sensor_cols_str}
+
+    # 2) zero-pad 6
+    map_pad6 = {}
+    for pid in pos_ids:
+        pid6 = zpad6(pid)
+        if pid6 in sensor_cols_str:
+            map_pad6[pid] = pid6
+
+    # 3) strip leading zeros
+    map_strip0 = {}
+    for pid in pos_ids:
+        s = strip0(pid)
+        if s in sensor_cols_str:
+            map_strip0[pid] = s
+        else:
+            s6 = zpad6(s)
+            if s6 in sensor_cols_str:
+                map_strip0[pid] = s6
+
+    # 4) index 0..N-1 -> premières colonnes
+    map_index = {}
+    if all(p.isdigit() for p in pos_ids):
+        nums = sorted(int(p) for p in pos_ids)
+        if nums and nums[0] == 0 and nums[-1] == len(nums) - 1:
+            for i, pid in enumerate(sorted(pos_ids, key=lambda x: int(x))):
+                if i < len(sensor_cols_str):
+                    map_index[pid] = sensor_cols_str[i]
+
+    candidates = [("exact", map_exact), ("pad6", map_pad6), ("strip0", map_strip0), ("index", map_index)]
+    best_name, best_map = max(candidates, key=lambda kv: len(kv[1]))
+
+    latlng = latlng_raw.copy()
+    if best_map:
+        latlng["data_col"] = latlng["sensor_id"].map(best_map)
+        latlng = latlng[latlng["data_col"].notna()].copy()
+    else:
+        st.warning("No matching positions for selected sensors. Showing nothing on the map.")
+        return
+
+    # ordre = celui de sensor_cols
+    order_index = {c: i for i, c in enumerate(sensor_cols_str)}
+    latlng["__ord"] = latlng["data_col"].map(order_index)
+    latlng = latlng.sort_values("__ord").drop(columns="__ord")
+
+    # garde uniquement les colonnes qui ont une position
+    sensor_cols = [c for c in sensor_cols_str if c in set(latlng["data_col"])]
+    if len(sensor_cols) == 0:
+        st.warning("After mapping, no sensors remain to plot.")
+        return
+
+    # -------------------- 2) temps / index --------------------
     imputed_df = pd.read_csv("pm25_imputed_live.csv")
     imputed_df["datetime"] = pd.to_datetime(imputed_df["datetime"], errors="coerce")
     sim_file["datetime"]    = pd.to_datetime(sim_file["datetime"], errors="coerce")
@@ -781,61 +883,38 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
     imputed_df.set_index("datetime", inplace=True)
     sim_file.set_index("datetime", inplace=True)
 
-    # ----------------------------
-    # 3) Header + one persistent map slot (title/time above the map)
-    # ----------------------------
+    # -------------------- 3) en-tête + slot carte --------------------
     map_container = st.container()
     with map_container:
         st.markdown("### Sensor Simulation Graph")
         time_slot = st.empty()
-    if "deck_slot" not in st.session_state:
-        st.session_state.deck_slot = st.empty()   # single, persistent placeholder for the map
 
-    # ----------------------------
-    # 4) positions (once)
-    # ----------------------------
-    latlng = positions_to_df(positions).copy()
-    latlng["latitude"]  = pd.to_numeric(latlng["latitude"], errors="coerce")
-    latlng["longitude"] = pd.to_numeric(latlng["longitude"], errors="coerce")
-    sid_order = [str(s) for s in latlng["sensor_id"].astype(str).tolist()]
-
-    # Build initial DF for the layer (all "Imputed" at start)
-    init_df = latlng.copy()
-    init_df["sensor_id"] = init_df["sensor_id"].astype(str)
-    init_df["value"]  = "NA"
-    init_df["status"] = "Imputed"
-    init_df["color"]  = [RED for _ in range(len(init_df))]
-
-    # ----------------------------
-    # 5) Init deck map ONCE (no blinking)
-    # ----------------------------
+    # -------------------- 4) initialisation Deck (une seule fois) --------------------
     if "deck_obj" not in st.session_state:
-        initial_view = compute_initial_view(latlng)
+        base_df = latlng.copy()
+        base_df["value"] = "NA"
+        base_df["status"] = "Imputed"
+        base_df["bg_color"] = [RED for _ in range(len(base_df))]
+        base_df["bg_radius"] = 12
+        base_df["icon"] = [ICON_SPEC] * len(base_df)
+        base_df["icon_size"] = 1.0
+
+        initial_view = fit_view(base_df)
         st.session_state.deck_obj = pdk.Deck(
-            layers=[make_layer(init_df)],
+            layers=[make_bg_layer(base_df), make_icon_layer(base_df)],
             initial_view_state=initial_view,
-            tooltip=make_tooltip(),
-            map_style="mapbox://styles/mapbox/light-v11",   # clear, English labels
+            map_style="mapbox://styles/mapbox/light-v11",   # clair, labels en anglais
+            tooltip={"text": "Sensor {sensor_id}\nValue: {value}\nStatus: {status}"}
         )
-        # First paint
-        st.session_state.deck_slot.pydeck_chart(st.session_state.deck_obj)
+        graph_placeholder.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
 
-    # Throttle + payload cache to avoid flicker
-    if "last_map_render" not in st.session_state:
-        st.session_state.last_map_render = 0.0
-    if "last_map_payload" not in st.session_state:
-        st.session_state.last_map_payload = None
-    MIN_INTERVAL = 0.30  # seconds between map redraws
-
-    # ----------------------------
-    # 6) layout below the map
-    # ----------------------------
+    # -------------------- 5) layout sous la carte --------------------
     st.markdown("---")
-    line3_col1, line3_col2 = st.columns([2, 2])
-    with line3_col1:
+    col_ts, col_slide = st.columns([2, 2])
+    with col_ts:
         st.subheader("Global Time Series")
         global_dashboard_placeholder = st.empty()
-    with line3_col2:
+    with col_slide:
         st.subheader("10-Step Snapshot")
         sliding_chart_placeholder = st.empty()
 
@@ -843,25 +922,18 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
     st.subheader("Missed Data (%)")
     gauge_placeholder = st.empty()
 
-    # ----------------------------
-    # 7) buffers for charts
-    # ----------------------------
+    # -------------------- 6) buffers --------------------
     sliding_window_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
     global_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
-
-    # palette for time-series lines
     sensor_custom_colors = [
         "#000000", "#003366", "#009999", "#006600", "#66CC66",
         "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"
     ]
-    sensor_color_map = {col: sensor_custom_colors[i % len(sensor_custom_colors)] for i, col in enumerate(sensor_cols)}
-    col_to_sid = {col: sid_order[i] for i, col in enumerate(sensor_cols)}  # stable mapping
+    sensor_color_map = {c: sensor_custom_colors[i % len(sensor_custom_colors)] for i, c in enumerate(sensor_cols)}
 
-    # ----------------------------
-    # 8) main loop (single loop only)
-    # ----------------------------
+    # -------------------- 7) boucle principale --------------------
     for current_time, row in sim_file.iterrows():
-        # (optional) your original guards
+        # vos gardes d'origine
         if current_time >= pd.Timestamp("2014-05-09 09:00:00"):
             break
         if current_time.time().strftime("%H:%M:%S") == "00:00:00":
@@ -869,56 +941,47 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
         if current_time not in imputed_df.index:
             continue
 
-        # --- build svals / sstates FIRST ---
-        imputed_row = imputed_df.loc[current_time]
+        # valeurs / états (même ordre que sensor_cols)
+        imp_row = imputed_df.loc[current_time]
         svals, sstates = [], []
         for col in sensor_cols:
-            val = row[col]
-            imputed_col = col.lstrip("0")  # mapping used in your data
-            if pd.isna(val):
-                svals.append(imputed_row.get(imputed_col))
-                sstates.append(False)   # imputed
+            v = row[col]
+            if pd.isna(v):
+                # mapping imputed : colonnes sans zéros à gauche si besoin
+                svals.append(imp_row.get(col.lstrip("0")))
+                sstates.append(False)
             else:
-                svals.append(val)
-                sstates.append(True)    # real
-        # enforce size
-        svals   = (svals + [None] * graph_size)[:graph_size]
-        sstates = (sstates + [False] * graph_size)[:graph_size]
+                svals.append(v)
+                sstates.append(True)
 
-        # append to buffers for time-series figures
+        # buffers pour les graphiques
         row_data = {"datetime": current_time}
         for i, col in enumerate(sensor_cols):
             row_data[col] = svals[i]
         sliding_window_df = pd.concat([sliding_window_df, pd.DataFrame([row_data])], ignore_index=True)
         global_df        = pd.concat([global_df,        pd.DataFrame([row_data])], ignore_index=True)
-        if len(sliding_window_df) > graph_size:
-            sliding_window_df = sliding_window_df.tail(graph_size)
+        if len(sliding_window_df) > len(sensor_cols):
+            sliding_window_df = sliding_window_df.tail(len(sensor_cols))
 
-        # --- Build tick DF for the map layer (aligned with positions order) ---
-        vals_by_col = {col: (svals[i] if i < len(svals) else None) for i, col in enumerate(sensor_cols)}
-        real_by_col = {col: (sstates[i] if i < len(sstates) else False) for i, col in enumerate(sensor_cols)}
-        vals_by_sid = {col_to_sid[col]: vals_by_col[col] for col in sensor_cols if col in col_to_sid}
-        real_by_sid = {col_to_sid[col]: real_by_col[col] for col in sensor_cols if col in col_to_sid}
+        # dictionnaires de valeurs/états clés = nom de colonne data
+        vals_by_col = {col: svals[i] for i, col in enumerate(sensor_cols)}
+        real_by_col = {col: sstates[i] for i, col in enumerate(sensor_cols)}
 
+        # dataframe tick pour la carte (fusion via data_col)
         tick_df = latlng.copy()
-        tick_df["sensor_id"] = tick_df["sensor_id"].astype(str)
-        tick_df["value"]  = tick_df["sensor_id"].map(lambda s: vals_by_sid.get(s, "NA"))
-        tick_df["status"] = tick_df["sensor_id"].map(lambda s: "Real" if real_by_sid.get(s, False) else "Imputed")
-        tick_df["color"]  = tick_df["status"].map(lambda s: GREEN if s == "Real" else RED)
+        tick_df["value"]  = tick_df["data_col"].map(vals_by_col).fillna("NA")
+        tick_df["status"] = tick_df["data_col"].map(lambda c: "Real" if real_by_col.get(c, False) else "Imputed")
+        tick_df["bg_color"] = [GREEN if s == "Real" else RED for s in tick_df["status"]]
+        tick_df["bg_radius"] = 12
+        tick_df["icon"] = [ICON_SPEC] * len(tick_df)
+        tick_df["icon_size"] = 1.0
 
-        # --- Update only the LAYER (no widget recreation → no blinking) ---
-        st.session_state.deck_obj.layers = [make_layer(tick_df)]
+        # mise à jour des couches (on garde le même Deck → pas de clignotement)
+        st.session_state.deck_obj.layers = [make_bg_layer(tick_df), make_icon_layer(tick_df)]
+        time_slot.markdown(f"**Current Time:** {current_time}")
+        graph_placeholder.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
 
-        # Throttle + only redraw if payload changed
-        payload = tuple(tick_df["status"].tolist())
-        now = time.time()
-        if payload != st.session_state.last_map_payload and (now - st.session_state.last_map_render) >= MIN_INTERVAL:
-            time_slot.markdown(f"**Current Time:** {current_time}")
-            st.session_state.deck_slot.pydeck_chart(st.session_state.deck_obj)
-            st.session_state.last_map_render = now
-            st.session_state.last_map_payload = payload
-
-        # ---- Sliding window (10-step) chart ----
+        # ---- Sliding 10-step ----
         sstate_by_col = {}
         for col in sensor_cols:
             sstate_by_col[col] = []
@@ -933,42 +996,34 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
             x_vals = list(sliding_window_df["datetime"])
             y_vals = list(sliding_window_df[col])
             states = sstate_by_col[col]
-
-            segment_x, segment_y, segment_state = [], [], []
-            for x, y, state in zip(x_vals, y_vals, states):
+            seg_x, seg_y, seg_state = [], [], []
+            for x, y, stt in zip(x_vals, y_vals, states):
                 if pd.isna(y):
                     continue
-                segment_x.append(x); segment_y.append(y); segment_state.append(state)
-                if len(segment_x) >= 2:
-                    seg_color = "red" if any(not s for s in segment_state) else color
+                seg_x.append(x); seg_y.append(y); seg_state.append(stt)
+                if len(seg_x) >= 2:
+                    seg_color = "red" if any(not s for s in seg_state) else color
                     sliding_fig.add_trace(go.Scatter(
-                        x=segment_x, y=segment_y, mode="lines+markers",
-                        name=f"Sensor {col}",
+                        x=seg_x, y=seg_y, mode="lines+markers",
                         line=dict(color=seg_color), marker=dict(size=6, color=seg_color),
                         showlegend=False
                     ))
-                    segment_x, segment_y, segment_state = [segment_x[-1]], [segment_y[-1]], [segment_state[-1]]
-
-            if len(segment_x) >= 2:
-                seg_color = "red" if any(s is False for s in segment_state) else color
+                    seg_x, seg_y, seg_state = [seg_x[-1]], [seg_y[-1]], [seg_state[-1]]
+            if len(seg_x) >= 2:
+                seg_color = "red" if any(s is False for s in seg_state) else color
                 sliding_fig.add_trace(go.Scatter(
-                    x=segment_x, y=segment_y, mode="lines+markers",
-                    name=f"Sensor {col}",
+                    x=seg_x, y=seg_y, mode="lines+markers",
                     line=dict(color=seg_color), marker=dict(size=6, color=seg_color),
                     showlegend=False
                 ))
 
         for col in sensor_cols:
-            sliding_fig.add_trace(go.Scatter(
-                x=[None], y=[None], mode='markers',
-                marker=dict(size=8, color=sensor_color_map[col]),
-                legendgroup=col, showlegend=True, name=f"Sensor {col}"
-            ))
-        sliding_fig.add_trace(go.Scatter(
-            x=[None], y=[None], mode='markers',
-            marker=dict(size=8, color="red"),
-            legendgroup="imputed", showlegend=True, name="Imputed Segment"
-        ))
+            sliding_fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers",
+                                             marker=dict(size=8, color=sensor_color_map[col]),
+                                             legendgroup=col, showlegend=True, name=f"Sensor {col}"))
+        sliding_fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers",
+                                         marker=dict(size=8, color="red"),
+                                         legendgroup="imputed", showlegend=True, name="Imputed Segment"))
         sliding_fig.update_layout(
             title="10-Step Snapshot",
             xaxis_title="Time", yaxis_title="Sensor Value",
@@ -977,11 +1032,11 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
         )
         sliding_chart_placeholder.plotly_chart(sliding_fig, use_container_width=True, key=f"sliding_{current_time}")
 
-        # ---- Global time series + Gauge ----
+        # ---- Global TS + Gauge ----
         full_ts_fig = draw_full_time_series(global_df.copy(), sim_file, sensor_cols, sensor_color_map)
-        with line3_col1:
+        with col_ts:
             global_dashboard_placeholder.plotly_chart(full_ts_fig, use_container_width=True, key=f"global_{current_time}")
-        with line3_col2:
+        with col_slide:
             gauge_fig = draw_gauge_figure(sim_file, current_time, sensor_cols)
             gauge_placeholder.plotly_chart(gauge_fig, use_container_width=True, key=f"gauge_{current_time}")
 
