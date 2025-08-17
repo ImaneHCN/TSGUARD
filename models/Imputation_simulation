@@ -1,0 +1,55 @@
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+EVAL_LENGTH = 24 # The sequence length the model was trained with
+SCALER_PARAMS_FILE="/kaggle/working/scaler_params.json"
+MODEL_FILE="/kaggle/input/gcn_lstm_imputer/pytorch/default/1/gcn_lstm_imputer (1).pth"
+# --- Load Sensors Info and Adjacency Matrix ---
+
+# Load Data 
+latlng = pd.read_csv('/kaggle/input/airq36/pm25/SampleData/pm25_latlng.txt')
+missing_df = pd.read_csv('/kaggle/input/airq36/pm25/SampleData/pm25_missing.txt', parse_dates=['datetime'], index_col='datetime')
+ground_df = pd.read_csv('/kaggle/input/airq36/pm25/SampleData/pm25_ground.txt', parse_dates=['datetime'], index_col='datetime')
+
+# Remove leading zeros from all column names
+missing_df.columns = [col.lstrip('0') if col.isdigit() else col for col in missing_df.columns]
+ground_df.columns = [col.lstrip('0') if col.isdigit() else col for col in ground_df.columns]
+
+
+# Force sensor columns to Be in in the same order
+sensor_cols = latlng['sensor_id'].astype(str).tolist()
+adj_matrix = create_adjacency_matrix(latlng_df).to(DEVICE)
+NUM_NODES = len(sensor_cols)
+
+# --- Load Scaler ---
+with open(SCALER_PARAMS_FILE, 'r') as f:
+    scaler_params = json.load(f)
+min_val, max_val = scaler_params['min_val'], scaler_params['max_val']
+scaler_func = lambda x: (x - min_val) / (max_val - min_val)
+inv_scaler_func = lambda x: x * (max_val - min_val) + min_val
+
+# --- Load Model ---
+model_config = {'GCN_HIDDEN': 64, 'LSTM_HIDDEN': 64}
+model = GCNLSTMImputer(
+    adj=adj_matrix, num_nodes=NUM_NODES, in_features=NUM_NODES,
+    gcn_hidden=model_config['GCN_HIDDEN'], lstm_hidden=model_config['LSTM_HIDDEN'], out_features=NUM_NODES
+).to(DEVICE)
+model.load_state_dict(torch.load(MODEL_FILE, map_location=DEVICE))
+
+target_sensor_idx= "you have to get the index"
+end_idx = filled_missing_df.index.get_loc(target_timestamp)
+start_idx = max(0, end_idx - EVAL_LENGTH)
+historical_window_df = filled_missing_df.iloc[start_idx:end_idx]
+
+# for this example, which mimics the live simulation logic.
+#historical_window_filled = historical_window_df.fillna(method='ffill').fillna(method='bfill')
+historical_window_np = historical_window_df.to_numpy(dtype=np.float32)
+
+
+# --- 3. Call the prediction function ---
+predicted_value = predict_single_missing_value(
+    historical_window=historical_window_np,
+    target_sensor_index=target_sensor_idx,
+    model=model,
+    scaler=scaler_func,
+    inv_scaler=inv_scaler_func,
+    device=DEVICE
+)
