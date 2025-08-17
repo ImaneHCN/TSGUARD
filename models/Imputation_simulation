@@ -35,16 +35,16 @@ model = GCNLSTMImputer(
 model.load_state_dict(torch.load(MODEL_FILE, map_location=DEVICE))
 
 target_sensor_idx= "you have to get the index"
-end_idx = filled_missing_df.index.get_loc(target_timestamp)
+end_idx = missing_df.index.get_loc(target_timestamp)
 start_idx = max(0, end_idx - EVAL_LENGTH)
-historical_window_df = filled_missing_df.iloc[start_idx:end_idx]
+historical_window_df = missing_df.iloc[start_idx:end_idx]
 
 # for this example, which mimics the live simulation logic.
 #historical_window_filled = historical_window_df.fillna(method='ffill').fillna(method='bfill')
 historical_window_np = historical_window_df.to_numpy(dtype=np.float32)
 
 
-# --- 3. Call the prediction function ---
+Call the prediction function 
 predicted_value = predict_single_missing_value(
     historical_window=historical_window_np,
     target_sensor_index=target_sensor_idx,
