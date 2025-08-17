@@ -1041,3 +1041,65 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
             gauge_placeholder.plotly_chart(gauge_fig, use_container_width=True, key=f"gauge_{current_time}")
 
         time.sleep(1)
+def predict_single_missing_value(
+    historical_window: np.ndarray,
+    target_sensor_index: int,
+    model: torch.nn.Module,
+    scaler: callable,
+    inv_scaler: callable,
+    device: torch.device
+) -> float:
+    """
+    Predicts the next value for a single sensor using a historical window.
+
+    Args:
+        historical_window (np.ndarray): A 2D NumPy array of shape (seq_len, num_sensors)
+                                        containing the recent historical data.
+                                        This window should NOT contain NaNs.
+        target_sensor_index (int): The integer index of the sensor whose value needs to be predicted.
+        model (torch.nn.Module): The pre-trained and loaded GCN-LSTM model.
+        scaler (callable): The function to normalize the data.
+        inv_scaler (callable): The function to inverse-normalize the data.
+        device (torch.device): The device (CPU or CUDA) to run the model on.
+
+    Returns:
+        float: The single imputed value for the target sensor at the next time step.
+    """
+    # --- 1. Input Validation ---
+    #expected_seq_len = model.lstm.input_size // model.gcn.weight.shape[0] * model.lstm.input_size
+    #print (expected_seq_len)
+    # A bit of a complex way to get seq_len, let's assume it's known. A better way:
+    # Let's say model config is available. For now, we'll rely on a fixed known value.
+    EVAL_LENGTH = 24 # This must match the model's training sequence length
+    
+    #if historical_window.shape[0] != EVAL_LENGTH:
+    #    raise ValueError(f"Historical window must have sequence length {EVAL_LENGTH}, but got {historical_window.shape[0]}")
+    if np.isnan(historical_window).any():
+        raise ValueError("The input 'historical_window' cannot contain NaN values. Please pre-fill it.")
+
+    # --- 2. Preprocessing ---
+    # Normalize the data
+    normalized_window = scaler(historical_window)
+    
+    # Convert to a PyTorch tensor, add a batch dimension, and move to device
+    input_tensor = torch.FloatTensor(normalized_window).unsqueeze(0).to(device)
+
+    # --- 3. Model Inference ---
+    model.eval()  # Set the model to evaluation mode
+    with torch.no_grad():  # Disable gradient calculation for efficiency
+        # The model predicts the *next* step for each step in the input sequence
+        output_sequence = model(input_tensor)
+
+    # --- 4. Post-processing and Output ---
+    # We need the prediction corresponding to the *last* time step of the input window.
+    # This gives us the predictions for all sensors at the next time step.
+    # Shape: (1, seq_len, num_sensors) -> (num_sensors,)
+    last_step_prediction_normalized = output_sequence[0, -1, :]
+
+    # Inverse-transform the predictions back to the original scale
+    all_sensor_predictions = inv_scaler(last_step_prediction_normalized.cpu().numpy())
+
+    # Extract the prediction for our specific target sensor
+    imputed_value = all_sensor_predictions[target_sensor_index]
+
+    return float(imputed_value)
