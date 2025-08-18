@@ -733,10 +733,100 @@ def draw_gauge_figure(sim_file, current_time, sensor_cols):
     return gauge_fig
 
 def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_placeholder, gauge_placeholder):
-    import math
+
     import base64
     from pathlib import Path
     import pydeck as pdk
+    import math
+
+    def _unwrap_longitudes(lons):
+        """Déroule les longitudes pour éviter un span > 180° (cas proche de l’antiméridien)."""
+        if not lons:
+            return lons
+        lons = sorted(lons)
+        best = lons
+        best_span = lons[-1] - lons[0]
+        # essaye des décalages de ±360 pour réduire le span
+        for shift in (-360.0, 0.0, 360.0):
+            shifted = sorted([((lon + 540 + shift) % 360) - 180 for lon in lons])
+            span = shifted[-1] - shifted[0]
+            if span < best_span:
+                best_span = span
+                best = shifted
+        return best
+
+    def fit_view_from_points(df_positions,
+                             width_px=1000, height_px=480,
+                             padding_px=80,
+                             extra_margin_pct=0.1,
+                             min_zoom=2.0, max_zoom=20.0):
+        """
+        Renvoie un pdk.ViewState qui fait rentrer tous les points avec padding.
+        Hypothèse tu utilises WebMercator (Mapbox / deck.gl).
+        """
+        import pydeck as pdk
+
+        if df_positions is None or df_positions.empty:
+            return pdk.ViewState(latitude=0, longitude=0, zoom=2)
+
+        lats = df_positions["latitude"].astype(float).tolist()
+        lons_raw = df_positions["longitude"].astype(float).tolist()
+        lons = _unwrap_longitudes(lons_raw)
+
+        lat_min, lat_max = min(lats), max(lats)
+        lon_min, lon_max = min(lons), max(lons)
+
+        # centre
+        lat_c = (lat_min + lat_max) / 2.0
+        lon_c = (lon_min + lon_max) / 2.0
+
+        # si un seul point, mets un zoom “proche”
+        if lat_min == lat_max and lon_min == lon_max:
+            return pdk.ViewState(latitude=lat_c, longitude=lon_c, zoom=14, min_zoom=min_zoom, max_zoom=max_zoom)
+
+        # projection mercator (en “unités monde” à zoom=0, taille 512)
+        def merc_y(lat_deg):
+            lat = max(min(lat_deg, 85.05113), -85.05113)  # clamp mercator
+            rad = math.radians(lat)
+            return math.log(math.tan(math.pi / 4 + rad / 2))
+
+        x_min, x_max = math.radians(lon_min), math.radians(lon_max)
+        y_min, y_max = merc_y(lat_min), merc_y(lat_max)
+
+        dx = abs(x_max - x_min)
+        dy = abs(y_max - y_min)
+
+        # ajoute une marge (%) pour la taille d’icône / halo
+        dx *= (1.0 + extra_margin_pct)
+        dy *= (1.0 + extra_margin_pct)
+
+        # zone utile (padding en pixels)
+        w_eff = max(1, width_px - 2 * padding_px)
+        h_eff = max(1, height_px - 2 * padding_px)
+
+        # relation deck.gl approx : pixels = 512 * 2^zoom * (span_radian / (2π))
+        # => zoom = log2( pixels * 2π / (512 * span_radian) )
+        # On prend le min des deux (lon/lat) pour tout faire rentrer.
+        if dx > 0:
+            zoom_x = math.log2((w_eff * 2 * math.pi) / (512.0 * dx))
+        else:
+            zoom_x = max_zoom
+        if dy > 0:
+            zoom_y = math.log2((h_eff * 2 * math.pi) / (512.0 * dy))
+        else:
+            zoom_y = max_zoom
+
+        zoom = max(min(zoom_x, zoom_y), min_zoom)
+        zoom = min(zoom, max_zoom)
+
+        # Re-centre le lon_c dans [-180, 180] pour éviter des surprises
+        lon_c = ((lon_c + 540) % 360) - 180
+
+        return pdk.ViewState(
+            latitude=lat_c, longitude=lon_c,
+            zoom=zoom, min_zoom=min_zoom, max_zoom=max_zoom,
+            pitch=0, bearing=0
+        )
 
     # -------------------- petites utils locales --------------------
     GREEN = [46, 204, 113, 190]   # RGBA (halo vert)
@@ -788,7 +878,8 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
         )
 
     def fit_view(latlng_df, pad_deg=0.02):
-        if latlng_df.empty:
+        import math, pydeck as pdk
+        if latlng_df is None or latlng_df.empty:
             return pdk.ViewState(latitude=0, longitude=0, zoom=2)
         lat_min, lat_max = float(latlng_df["latitude"].min()), float(latlng_df["latitude"].max())
         lon_min, lon_max = float(latlng_df["longitude"].min()), float(latlng_df["longitude"].max())
@@ -899,15 +990,34 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
         base_df["icon"] = [ICON_SPEC] * len(base_df)
         base_df["icon_size"] = 1.0
 
-        initial_view = fit_view(base_df)
+        initial_view = fit_view_from_points(
+            base_df,
+            width_px=1000,  # ajuste si ton conteneur est plus large
+            height_px=480,
+            padding_px=80,
+            extra_margin_pct=0.15  # un peu de marge pour les icônes
+        )
         st.session_state.deck_obj = pdk.Deck(
             layers=[make_bg_layer(base_df), make_icon_layer(base_df)],
             initial_view_state=initial_view,
-            map_style="mapbox://styles/mapbox/light-v11",   # clair, labels en anglais
+            map_style="mapbox://styles/mapbox/light-v11",
             tooltip={"text": "Sensor {sensor_id}\nValue: {value}\nStatus: {status}"}
         )
         graph_placeholder.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
 
+        # Put a small control row under the title to re-fit on demand
+        ctrl_col1, _ = st.columns([1, 5])
+        with ctrl_col1:
+            if st.button("Fit map to sensors", key="fit_to_sensors_btn"):
+                st.session_state.deck_obj.initial_view_state = fit_view_from_points(
+                    base_df,
+                    width_px=1000,
+                    height_px=480,
+                    padding_px=80,
+                    extra_margin_pct=0.15
+                )
+                graph_placeholder.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
+        # =======================================
     # -------------------- 5) layout sous la carte --------------------
     st.markdown("---")
     col_ts, col_slide = st.columns([2, 2])
