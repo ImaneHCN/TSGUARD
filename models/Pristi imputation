@@ -1,0 +1,232 @@
+#-------------------- clone and install requirements-------------
+# Clone the Pristi repository clone 
+!git clone https://github.com/LMZZML/PriSTI.git
+
+# Navigate into the directory
+!cd PriSTI
+
+# Install the required packages
+!pip install -r /kaggle/working/PriSTI/requirements.txt
+
+#-------------------- Add Presti to sys.path-------------
+import sys
+sys.path.append('/kaggle/working/PriSTI') 
+
+#-------------------- Import and set paths-------------
+# Imports and paths 
+import os, sys, json, yaml, pickle, numpy as np, pandas as pd, torch
+
+# Paths – adjust if your layout differs
+PRISTI_ROOT = "/kaggle/working/PriSTI"
+CONFIG_PATH = f"{PRISTI_ROOT}/config/base.yaml"
+WEIGHTS_PATH = f"{PRISTI_ROOT}/save/aqi36/model.pth"   # included in your working tree
+MEANSTD_PK = "/kaggle/input/airq36/pm25/pm25_meanstd.pk"  # from AQI-36 dataset
+
+# Make PriSTI importable
+sys.path.append(PRISTI_ROOT)
+
+from main_model import PriSTI_aqi36
+
+
+#-------------------- Configure and load Presti model -------------
+import os, shutil
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load config
+with open(CONFIG_PATH, "r") as f:
+    config = yaml.safe_load(f)
+
+# Load per-sensor mean/std used by AQI-36
+with open(MEANSTD_PK, "rb") as f:
+    meanstd = pickle.load(f)
+
+# Adjust these depending on the exact structure
+#print(type(meanstd))
+#print(len(meanstd))
+#print(meanstd[0][:5])  # first 5 values of mean
+#print(meanstd[1][:5])  # first 5 values of std
+
+mean = np.asarray(meanstd[0], dtype=np.float32)
+std  = np.asarray(meanstd[1], dtype=np.float32)
+std_safe = np.where(std == 0, 1.0, std)
+
+with open(CONFIG_PATH, "r") as f:
+    config = yaml.safe_load(f)
+
+config["model"]["is_unconditional"] = False       
+config["model"]["target_strategy"] = "hybrid"
+config["diffusion"]["adj_file"] = "AQI36"        
+config["seed"] = 42
+
+os.makedirs("./data/pm25/SampleData", exist_ok=True)
+shutil.copy(
+    "/kaggle/input/airq36/pm25/SampleData/pm25_latlng.txt",
+    "./data/pm25/SampleData/pm25_latlng.txt"
+)
+
+def scale_window(x_2d: np.ndarray) -> np.ndarray:
+    # x_2d shape: (T, N)
+    return (x_2d - mean) / std_safe
+
+def inv_scale_vec(x_1d: np.ndarray) -> np.ndarray:
+    # x_1d shape: (N,)
+    return x_1d * std_safe + mean
+
+# Load PriSTI AQI-36 model
+model = PriSTI_aqi36(config, DEVICE).to(DEVICE)
+state = torch.load(WEIGHTS_PATH, map_location=DEVICE)
+model.load_state_dict(state)
+model.eval()
+
+
+#-------------------- Imputation function -------------
+def impute_window_with_pristi(
+    missing_df: pd.DataFrame,
+    sensor_cols: list[str],
+    target_timestamp: pd.Timestamp,
+    model: torch.nn.Module,
+    device: torch.device,
+    eval_len: int = 36,
+    nsample: int = 100
+):
+   
+    
+    if "scale_window" not in globals() or "inv_scale_vec" not in globals():
+        return missing_df.copy(), "Scaling functions not found."
+    if list(missing_df.columns) != list(sensor_cols):
+        return missing_df.copy(), "Columns mismatch."
+    if target_timestamp not in missing_df.index:
+        return missing_df.copy(), f"{target_timestamp} not in DataFrame index."
+
+    #Slice the window 
+    end_loc = missing_df.index.get_loc(target_timestamp)
+    if isinstance(end_loc, slice):
+        return missing_df.copy(), "Ambiguous target timestamp."
+    start_loc = end_loc - (eval_len - 1)
+    if start_loc < 0:
+        return missing_df.copy(), f"Not enough history (<{eval_len} rows)."
+
+    time_index = missing_df.index[start_loc:end_loc + 1]
+    filled_df = missing_df.ffill().bfill()  # replacement for deprecated fillna(method=...)
+
+    window_filled = filled_df.iloc[start_loc:end_loc + 1].to_numpy(dtype=np.float32)
+    window_orig   = missing_df.iloc[start_loc:end_loc + 1].to_numpy(dtype=np.float32)
+    T, N = window_filled.shape
+
+    # Mask (1=observed, 0=missing)
+    mask_np = (~np.isnan(window_orig)).astype(np.float32)
+    if not (mask_np == 0).any():
+        return missing_df.copy(), "No missing values in window."
+
+    # Scale and to tensors 
+    window_scaled = scale_window(window_filled)
+    x_TN = torch.from_numpy(window_scaled).unsqueeze(0).to(device)
+    m_TN = torch.from_numpy(mask_np).unsqueeze(0).to(device)
+    x_NL = x_TN.permute(0, 2, 1).contiguous()  # (1, N, T)
+    m_NL = m_TN.permute(0, 2, 1).contiguous()
+
+    # PriSTI API
+    inner = getattr(model, "model", getattr(model, "module", model))
+    if not hasattr(inner, "get_side_info"):
+        return missing_df.copy(), "PriSTI instance required."
+
+    observed_tp = torch.arange(T, device=device, dtype=torch.float32).unsqueeze(0)
+    side_info = inner.get_side_info(observed_tp, m_NL)
+
+    itp_info = None
+    if getattr(inner, "use_guide", False):
+        coeffs = torch.zeros((1, N, T), device=device, dtype=torch.float32)
+        itp_info = coeffs.unsqueeze(1)
+
+    inner.eval()
+    with torch.no_grad():
+        try:
+            y_pred = inner.impute(x_NL, m_NL, side_info, int(nsample), itp_info)
+        except TypeError:
+            y_pred = inner.impute(x_NL, m_NL, side_info, int(nsample))
+
+    if not isinstance(y_pred, torch.Tensor):
+        return missing_df.copy(), "Non-tensor output."
+
+    # Reduce samples & align shape ---
+    if y_pred.dim() == 4:
+        if y_pred.shape[0] == nsample:
+            y_pred = y_pred.mean(dim=0)
+        elif y_pred.shape[1] == nsample:
+            y_pred = y_pred.mean(dim=1)
+        else:
+            y_pred = y_pred.mean(dim=0)
+
+    if y_pred.dim() != 3:
+        return missing_df.copy(), f"Unexpected output rank: {y_pred.dim()}."
+
+    pred3 = y_pred[0]
+    if pred3.shape == (N, T):
+        pred_scaled_NT = pred3
+    elif pred3.shape == (T, N):
+        pred_scaled_NT = pred3.transpose(0, 1).contiguous()
+    else:
+        return missing_df.copy(), f"Unexpected output shape {tuple(pred3.shape)}."
+
+    # Inverse scale 
+    pred_scaled_TN = pred_scaled_NT.transpose(0, 1).detach().cpu().numpy()  # (T, N)
+    pred_unscaled_TN = np.vstack([inv_scale_vec(pred_scaled_TN[t, :]) for t in range(T)])
+
+    # Fill missing values & print
+    updated_df = missing_df.copy()
+    miss_mask_bool = (mask_np == 0)
+
+    '''for t_idx in range(T):
+        ts = time_index[t_idx]
+        for n_idx in range(N):
+            if miss_mask_bool[t_idx, n_idx]:
+                sensor_name = sensor_cols[n_idx]
+                value = float(pred_unscaled_TN[t_idx, n_idx])
+                print(f"{ts} | {sensor_name}: {value:.6f}")
+                updated_df.loc[ts, sensor_name] = value'''
+
+    return updated_df, "ok"
+
+#-------------------- Load data and impute missing -------------
+
+latlng = pd.read_csv('/kaggle/input/airq36/pm25/SampleData/pm25_latlng.txt')
+missing_df = pd.read_csv(
+    '/kaggle/input/airq36/pm25/SampleData/pm25_missing.txt',
+    parse_dates=['datetime'], index_col='datetime'
+)
+ground_df = pd.read_csv(
+    '/kaggle/input/airq36/pm25/SampleData/pm25_ground.txt',
+    parse_dates=['datetime'], index_col='datetime'
+)
+
+# Normalize/align column names
+missing_df.columns = [col.lstrip('0') if col.isdigit() else col for col in missing_df.columns]
+ground_df.columns  = [col.lstrip('0')  if col.isdigit() else col for col in ground_df.columns]
+sensor_cols = latlng['sensor_id'].astype(str).tolist()
+missing_df = missing_df[sensor_cols]  # enforce order
+
+EVAL_LENGTH = 36  # size of PriSTI window
+nsample = 100     # number of imputation samples
+
+# --- Main loop over all timestamps with at least EVAL_LENGTH history ---
+for idx in range(EVAL_LENGTH - 1, len(missing_df)):
+    ts = missing_df.index[idx]
+    row = missing_df.iloc[idx]
+    
+    if row.isna().any():
+        updated_df, info = impute_window_with_pristi(
+            missing_df=missing_df,
+            sensor_cols=sensor_cols,
+            target_timestamp=ts,
+            model=model,
+            device=DEVICE,
+            eval_len=EVAL_LENGTH,
+            nsample=nsample
+        )
+        
+        if info == "ok":
+            # Update missing_df in-place so future windows benefit from filled values
+            missing_df = updated_df
+        else:
+            print(f"Skipped {ts} -> {info}")
+
