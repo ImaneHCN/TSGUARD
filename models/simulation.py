@@ -1,25 +1,13 @@
-import json
-import time
 import torch
 import torch.nn as nn
-from torch import optim
 from torch.utils.data import DataLoader, Dataset
 import models.sim_helper as helper
 import streamlit as st
-import plotly.graph_objects as go
-import pandas as pd
-from utils.visualization import draw_graph, draw_dashboard
 from utils.config import DEFAULT_VALUES
 import time
-import helpers as Help
-import pydeck as pdk
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
-
-import base64
-from pathlib import Path
-
 import base64
 from pathlib import Path
 
@@ -39,6 +27,7 @@ ICON_SPEC = {
     "anchorX": ICON_W // 2,   # center the icon at the point
     "anchorY": ICON_H // 2
 }
+
 def init_sensor_map(latlng_df):
     center_lat = float(latlng_df["latitude"].mean()) if len(latlng_df) else 0.0
     center_lon = float(latlng_df["longitude"].mean()) if len(latlng_df) else 0.0
@@ -121,31 +110,20 @@ def make_sensor_map_plotly(latlng_df, values_by_sensor, is_real_by_sensor):
         title=None,
     )
     return fig
-
 class GraphConvolution(nn.Module):
     def __init__(self, in_features, out_features):
-        super(GraphConvolution, self).__init__()
+        super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        # The weight matrix transforms features AFTER aggregation.
-        # The input to this transformation has the same dimension as the number of nodes.
         self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
         nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x, adj):
-        # x shape: (batch_size, num_nodes)
-        # adj shape: (num_nodes, num_nodes)
-
-        # Correct order of operations: (Â * X) * W
-        # 1. Aggregate features from neighbors (Â * X)
-        # To handle the batch, we compute Â * X^T and then transpose the result.
-        aggregated_features = torch.spmm(adj, x.t()).t()  # (N,N) @ (N,B) -> (N,B) -> (B,N)
-
-        # 2. Transform the aggregated features (result * W)
-        output = torch.mm(aggregated_features, self.weight)  # (B,N) @ (N, F_out) -> (B, F_out)
-
-        return output
-
+        # x: (B, N), adj: (N, N) dense
+        # aggregate neighbors: X @ Â^T  (Â is symmetric, so T doesn't matter)
+        agg = x.matmul(adj.t())
+        out = agg.matmul(self.weight)          # (B, N) @ (N, F_out) -> (B, F_out)
+        return out
 
 class GCNLSTMImputer(nn.Module):
     def __init__(self, adj, num_nodes, in_features, gcn_hidden, lstm_hidden, out_features):
@@ -336,32 +314,31 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 
 def create_adjacency_matrix(latlng_df, threshold_type='gaussian', sigma_sq_ratio=0.1):
     num_sensors = len(latlng_df)
-    dist_matrix = np.zeros((num_sensors, num_sensors))
+    dist_matrix = np.zeros((num_sensors, num_sensors), dtype=np.float64)
 
     for i in range(num_sensors):
         for j in range(i, num_sensors):
-            lat1, lon1 = latlng_df.iloc[i]['latitude'], latlng_df.iloc[i]['longitude']
-            lat2, lon2 = latlng_df.iloc[j]['latitude'], latlng_df.iloc[j]['longitude']
-            dist = haversine_distance(lat1, lon1, lat2, lon2)
-            dist_matrix[i, j] = dist_matrix[j, i] = dist
+            lat1, lon1 = latlng_df.iloc[i]['latitude'],  latlng_df.iloc[i]['longitude']
+            lat2, lon2 = latlng_df.iloc[j]['latitude'],  latlng_df.iloc[j]['longitude']
+            d = haversine_distance(lat1, lon1, lat2, lon2)
+            dist_matrix[i, j] = dist_matrix[j, i] = d
 
     if threshold_type == 'gaussian':
-        # Use a Gaussian kernel to compute weights
-        sigma_sq = dist_matrix.std()**2 * sigma_sq_ratio
-        adj_matrix = np.exp(-dist_matrix**2 / sigma_sq)
-    else: # Simple binary threshold
+        sigma = dist_matrix.std()
+        sigma_sq = (sigma * sigma) * sigma_sq_ratio
+        sigma_sq = max(sigma_sq, 1e-6)  # <- avoid div-by-zero
+        adj_matrix = np.exp(-np.square(dist_matrix) / sigma_sq)
+    else:
         threshold = np.mean(dist_matrix) * 0.5
         adj_matrix = (dist_matrix <= threshold).astype(float)
 
-    # Add self-loops
-    np.fill_diagonal(adj_matrix, 1)
+    np.fill_diagonal(adj_matrix, 1.0)
 
-    # Symmetric normalization
     D = np.diag(np.sum(adj_matrix, axis=1))
     D_inv_sqrt = np.linalg.inv(np.sqrt(D))
-    adj_matrix_normalized = D_inv_sqrt @ adj_matrix @ D_inv_sqrt
+    adj_norm = D_inv_sqrt @ adj_matrix @ D_inv_sqrt
 
-    return torch.FloatTensor(adj_matrix_normalized)
+    return torch.tensor(adj_norm, dtype=torch.float32)
 
 
 def train_model(train_file, missing_file, positions_file, epochs, model_path):
@@ -373,7 +350,7 @@ def train_model(train_file, missing_file, positions_file, epochs, model_path):
     import streamlit as st
     from torch.utils.data import DataLoader
     from io import BytesIO
-    import json
+    import json, os
 
     # ---- helpers ------------------------------------------------------------
     def norm_id_colname(c: object) -> str:
@@ -485,12 +462,22 @@ def train_model(train_file, missing_file, positions_file, epochs, model_path):
     missing_df = missing_file.copy()
 
     # Normalize column names: keep datetime, zero-pad purely digit names
-    ground_df = norm_df_columns(ground_df)
-    missing_df = norm_df_columns(missing_df)
+    #ground_df = norm_df_columns(ground_df)
+    #missing_df = norm_df_columns(missing_df)
 
-    # Ensure datetime index
+    # Ensure datetime index for both
     ground_df = ensure_datetime_index(ground_df)
     missing_df = ensure_datetime_index(missing_df)
+
+    # If still not datetime, try to coerce index directly
+    if not isinstance(ground_df.index, pd.DatetimeIndex):
+        ground_df.index = pd.to_datetime(ground_df.index, errors="coerce")
+    if not isinstance(missing_df.index, pd.DatetimeIndex):
+        missing_df.index = pd.to_datetime(missing_df.index, errors="coerce")
+
+    # Drop rows where datetime could not be parsed
+    ground_df = ground_df[~ground_df.index.isna()]
+    missing_df = missing_df[~missing_df.index.isna()]
 
     # Load and normalize positions
     latlng = load_positions_df(positions_file)  # columns: sensor_id, latitude, longitude
@@ -633,6 +620,12 @@ def train_model(train_file, missing_file, positions_file, epochs, model_path):
     MODEL_SAVE_PATH = model_path if model_path else "gcn_lstm_imputer.pth"
     torch.save(model.state_dict(), MODEL_SAVE_PATH)
     print(f"Epoch {epoch + 1}/{epochs} | Train Loss: {avg_train_loss:.6f}")
+    scaler_path = os.path.splitext(MODEL_SAVE_PATH)[0] + "_scaler.json"
+    with open(scaler_path, "w") as f:
+        json.dump(scaler_params, f)
+    print(f"Scaler params saved to {scaler_path}")
+
+    return model
 
 
 def draw_full_time_series(global_df, sim_file, sensor_cols, sensor_color_map):
@@ -696,6 +689,57 @@ def draw_full_time_series(global_df, sim_file, sensor_cols, sensor_color_map):
         yaxis_title="Sensor Value",
         margin=dict(l=20, r=20, t=40, b=20),
         legend_title="Sensors"
+    )
+    return fig
+
+def draw_full_time_series_with_mask(global_df, imputed_mask, sensor_cols, sensor_color_map):
+    import plotly.graph_objects as go
+    import pandas as pd
+
+    fig = go.Figure()
+    # segments colorés selon imputation
+    for col in sensor_cols:
+        base_color = sensor_color_map[col]
+        x_vals = global_df["datetime"].tolist()
+        y_vals = global_df[col].tolist()
+
+        seg_x, seg_y, seg_imp = [], [], []
+        for x, y in zip(x_vals, y_vals):
+            if pd.isna(y):
+                continue
+            imputed = bool(imputed_mask.loc[x, col]) if (x in imputed_mask.index) else False
+            seg_x.append(x); seg_y.append(y); seg_imp.append(imputed)
+            if len(seg_x) >= 2:
+                seg_color = "red" if any(seg_imp) else base_color
+                fig.add_trace(go.Scatter(
+                    x=seg_x, y=seg_y, mode="lines+markers",
+                    line=dict(color=seg_color), marker=dict(size=6, color=seg_color),
+                    showlegend=False
+                ))
+                seg_x, seg_y, seg_imp = [seg_x[-1]], [seg_y[-1]], [seg_imp[-1]]
+        if len(seg_x) >= 2:
+            seg_color = "red" if any(seg_imp) else base_color
+            fig.add_trace(go.Scatter(
+                x=seg_x, y=seg_y, mode="lines+markers",
+                line=dict(color=seg_color), marker=dict(size=6, color=seg_color),
+                showlegend=False
+            ))
+
+    # légendes
+    for col in sensor_cols:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode='markers',
+            marker=dict(size=8, color=sensor_color_map[col]),
+            legendgroup=col, showlegend=True, name=f"Sensor {col}"
+        ))
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode='markers',
+        marker=dict(size=8, color="red"),
+        legendgroup="imputed", showlegend=True, name="Imputed Segment"
+    ))
+    fig.update_layout(
+        xaxis_title="Time", yaxis_title="Sensor Value",
+        margin=dict(l=20, r=20, t=40, b=20), legend_title="Sensors"
     )
     return fig
 
@@ -1000,7 +1044,7 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
         st.session_state.deck_obj = pdk.Deck(
             layers=[make_bg_layer(base_df), make_icon_layer(base_df)],
             initial_view_state=initial_view,
-            map_style="mapbox://styles/mapbox/light-v11",
+            map_style="mapbox://styles/mapbox/pink-v9",
             tooltip={"text": "Sensor {sensor_id}\nValue: {value}\nStatus: {status}"}
         )
         graph_placeholder.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
@@ -1033,8 +1077,8 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
     gauge_placeholder = st.empty()
 
     # -------------------- 6) buffers --------------------
-    sliding_window_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
-    global_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
+    #sliding_window_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
+    #global_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
     sensor_custom_colors = [
         "#000000", "#003366", "#009999", "#006600", "#66CC66",
         "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"
@@ -1151,6 +1195,7 @@ def start_simulation(sim_file, positions, graph_placeholder, sliding_chart_place
             gauge_placeholder.plotly_chart(gauge_fig, use_container_width=True, key=f"gauge_{current_time}")
 
         time.sleep(1)
+
 def predict_single_missing_value(
     historical_window: np.ndarray,
     target_sensor_index: int,
@@ -1213,3 +1258,500 @@ def predict_single_missing_value(
     imputed_value = all_sensor_predictions[target_sensor_index]
 
     return float(imputed_value)
+
+def run_simulation_with_live_imputation(
+    sim_df: pd.DataFrame,
+    missing_df: pd.DataFrame,
+    positions,
+    model: torch.nn.Module,
+    scaler: callable,
+    inv_scaler: callable,
+    device: torch.device,
+    graph_placeholder,
+    sliding_chart_placeholder,
+    gauge_placeholder,
+    window_hours: int = 24,
+):
+    """
+    Streamed simulation with live, single-point imputation.
+    - At each timestamp and for each sensor col:
+        * if missing_df value is NaN -> predict (or fallback) using a rolling window
+          from *missing_df* (which accumulates prior imputations), then write back.
+        * else use the real value.
+    - Map: green=Real, red=Predicted.
+    - Gauge: % originally missing (from sim_df) up to 'now'.
+    """
+    import time
+    import numpy as np
+    import pandas as pd
+    import plotly.graph_objects as go
+    import pydeck as pdk
+    import streamlit as st
+
+    # -------- helpers: mapping & view fit ------------------------------------
+    def zpad6(s: str) -> str:
+        return s if not s.isdigit() else s.zfill(6)
+
+    def strip0(s: str) -> str:
+        t = s.lstrip("0")
+        return t if t else "0"
+
+    GREEN = [46, 204, 113, 200]   # Real
+    RED   = [231, 76, 60, 200]    # Predicted
+
+    def make_bg_layer(df):
+        return pdk.Layer(
+            "ScatterplotLayer",
+            data=df,
+            get_position=["longitude", "latitude"],
+            get_fill_color="bg_color",
+            get_radius="bg_radius",
+            radius_scale=1,
+            radius_min_pixels=6,
+            radius_max_pixels=22,
+            stroked=True,
+            get_line_color=[255, 255, 255, 180],
+            line_width_min_pixels=1,
+            pickable=False,
+        )
+
+    def make_icon_layer(df):
+        # ICON_SPEC should exist at module level; if not, fall back to size-only points
+        return pdk.Layer(
+            "IconLayer",
+            data=df,
+            get_icon="icon",
+            get_position=["longitude", "latitude"],
+            get_size="icon_size",
+            size_scale=8,
+            size_min_pixels=14,
+            size_max_pixels=28,
+            pickable=True,
+        )
+
+    def fit_view_simple(df: pd.DataFrame, padding_deg=0.02) -> pdk.ViewState:
+        if df is None or df.empty:
+            return pdk.ViewState(latitude=0, longitude=0, zoom=2, bearing=0, pitch=0)
+        lat_min = float(df["latitude"].min());  lat_max = float(df["latitude"].max())
+        lon_min = float(df["longitude"].min()); lon_max = float(df["longitude"].max())
+        lat_c = (lat_min + lat_max) / 2.0
+        lon_c = (lon_min + lon_max) / 2.0
+        span = max(lat_max - lat_min, lon_max - lon_min) + padding_deg
+        span = max(span, 1e-3)
+        zoom = max(1.0, min(16.0, np.log2(360.0 / span)))
+        return pdk.ViewState(latitude=lat_c, longitude=lon_c, zoom=zoom, bearing=0, pitch=0)
+
+    # -------- 0) choose sensor set ------------------------------------------
+    all_sensor_cols = [c for c in sim_df.columns if c != "datetime"]
+    graph_size = int(st.session_state.get("graph_size", DEFAULT_VALUES["graph_size"]))
+    sensor_cols = [str(c) for c in all_sensor_cols[:graph_size]]
+
+    # -------- 1) normalize/prepare positions and align to sensor_cols --------
+    latlng_raw = positions_to_df(positions).copy()
+    latlng_raw["sensor_id"] = latlng_raw["sensor_id"].astype(str).str.strip()
+    latlng_raw["latitude"]  = pd.to_numeric(latlng_raw["latitude"],  errors="coerce")
+    latlng_raw["longitude"] = pd.to_numeric(latlng_raw["longitude"], errors="coerce")
+    latlng_raw = latlng_raw.dropna(subset=["latitude", "longitude"])
+
+    pos_ids = latlng_raw["sensor_id"].tolist()
+
+    # mapping strategies
+    map_exact  = {pid: pid for pid in pos_ids if pid in sensor_cols}
+    map_pad6   = {pid: zpad6(pid) for pid in pos_ids if zpad6(pid) in sensor_cols}
+    map_strip0 = {}
+    for pid in pos_ids:
+        s  = strip0(pid)
+        s6 = zpad6(s)
+        if s in sensor_cols:
+            map_strip0[pid] = s
+        elif s6 in sensor_cols:
+            map_strip0[pid] = s6
+
+    map_index = {}
+    if all(p.isdigit() for p in pos_ids):
+        nums = sorted(int(p) for p in pos_ids)
+        if nums and nums[0] == 0 and nums[-1] == len(nums) - 1:
+            for i, pid in enumerate(sorted(pos_ids, key=lambda x: int(x))):
+                if i < len(sensor_cols):
+                    map_index[pid] = sensor_cols[i]
+
+    candidates = [map_exact, map_pad6, map_strip0, map_index]
+    best_map = max(candidates, key=lambda m: len(m))
+    if len(best_map) == 0:
+        st.info("No matching positions for selected sensors. Nothing to display.")
+        return
+
+    latlng = latlng_raw.copy()
+    latlng["data_col"] = latlng["sensor_id"].map(best_map)
+    latlng = latlng[latlng["data_col"].notna()].copy()
+
+    order_index = {c: i for i, c in enumerate(sensor_cols)}
+    latlng["__ord"] = latlng["data_col"].map(order_index)
+    latlng = latlng.sort_values("__ord").drop(columns="__ord").reset_index(drop=True)
+
+    # keep only mapped sensors, preserve order
+    sensor_cols = [c for c in sensor_cols if c in set(latlng["data_col"])]
+    if not sensor_cols:
+        st.info("After mapping, no sensors remain to plot.")
+        return
+
+    # quick index lookup for model target
+    col_to_idx = {c: i for i, c in enumerate(sensor_cols)}
+
+    # -------- 2) align time indexes (hourly) --------------------------------
+    sim_df     = sim_df.copy()
+    missing_df = missing_df.copy()
+
+    # --- ensure a 'datetime' column exists in both dataframes ---
+    def ensure_datetime_column(df: pd.DataFrame, name: str) -> pd.DataFrame:
+        if "datetime" in df.columns:
+            return df
+        # if the index is already datetime, turn it into a column
+        if isinstance(df.index, pd.DatetimeIndex):
+            out = df.reset_index().rename(columns={"index": "datetime"})
+            return out
+        # common alternate names
+        for alt in ("timestamp", "date", "time"):
+            if alt in df.columns:
+                out = df.rename(columns={alt: "datetime"})
+                return out
+        # last resort: try parsing an index that looks like datetimes
+        try:
+            idx_as_dt = pd.to_datetime(df.index, errors="raise")
+            out = df.reset_index().rename(columns={"index": "datetime"})
+            out["datetime"] = idx_as_dt
+            return out
+        except Exception:
+            raise KeyError(
+                f"{name} has no 'datetime' column or datetime-like index. "
+                f"Columns: {list(df.columns)[:8]}"
+            )
+
+    sim_df = ensure_datetime_column(sim_df, "sim_df")
+    missing_df = ensure_datetime_column(missing_df, "missing_df")
+
+    sim_df["datetime"]     = pd.to_datetime(sim_df["datetime"], errors="coerce")
+    missing_df["datetime"] = pd.to_datetime(missing_df["datetime"], errors="coerce")
+    sim_df     = sim_df.dropna(subset=["datetime"]).copy()
+    missing_df = missing_df.dropna(subset=["datetime"]).copy()
+
+    sim_df["datetime"]     = sim_df["datetime"].dt.floor("h")
+    missing_df["datetime"] = missing_df["datetime"].dt.floor("h")
+    sim_df.set_index("datetime", inplace=True)
+    missing_df.set_index("datetime", inplace=True)
+
+    common_index = sim_df.index.intersection(missing_df.index)
+    if common_index.empty or latlng.empty:
+        st.info("No matching timeline or positions/sensors. Nothing to display.")
+        return
+
+    # --- trace des points imputés (même index/colonnes que les données) ---
+    imputed_mask = pd.DataFrame(False, index=common_index, columns=sensor_cols, dtype=bool)
+
+    sim_df     = sim_df.loc[common_index].sort_index()
+    missing_df = missing_df.loc[common_index].sort_index()
+
+    # -------- 3) header slot + persistent deck.gl map -----------------------
+    map_container = st.container()
+    with map_container:
+        st.markdown("### Sensor Simulation Graph")
+        time_slot = st.empty()
+
+    # fall back icon spec if not present
+    global ICON_SPEC
+    if "ICON_SPEC" not in globals() or ICON_SPEC is None:
+        ICON_SPEC = {"url": "", "width": 1, "height": 1, "anchorX": 0, "anchorY": 0}
+
+    if "deck_obj" not in st.session_state:
+        base_df = latlng.copy()
+        base_df["sensor_id"] = base_df["sensor_id"].astype(str)
+        base_df["value"] = "NA"
+        base_df["status"] = "Predicted"
+        base_df["bg_color"] = [RED for _ in range(len(base_df))]
+        base_df["bg_radius"] = 10
+        base_df["icon"] = [ICON_SPEC] * len(base_df)
+        base_df["icon_size"] = 1.0
+
+        initial_view = fit_view_simple(base_df)
+
+        st.session_state.deck_obj = pdk.Deck(
+            layers=[make_bg_layer(base_df), make_icon_layer(base_df)],
+            initial_view_state=initial_view,
+            map_style="mapbox://styles/mapbox/light-v11",
+            tooltip={"text": "Sensor {sensor_id}\nValue: {value}\nStatus: {status}"},
+        )
+        graph_placeholder.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
+        st.session_state._fit_base_df = base_df.copy()
+
+    ctrl_col1, _ = st.columns([1, 5])
+    with ctrl_col1:
+        if st.button("Fit map to sensors", key="fit_to_sensors_btn"):
+            st.session_state.deck_obj.initial_view_state = fit_view_simple(st.session_state._fit_base_df)
+            graph_placeholder.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
+
+    # --- layout for charts: two side-by-side under the map, then gauge ---
+    if not st.session_state.get("_charts_layout_inited", False):
+        st.markdown("---")
+        col_ts, col_snap = st.columns([2, 2])
+
+        with col_ts:
+            st.subheader("Global Time Series")
+            st.session_state["_global_ts_ph"] = st.empty()  # persistent placeholder
+
+        with col_snap:
+            st.subheader("10-Step Snapshot")
+            st.session_state["_snapshot_ph"] = st.empty()  # persistent placeholder
+
+        st.markdown("---")
+        st.subheader("Missed Data (%)")
+        st.session_state["_gauge_ph"] = st.empty()  # persistent placeholder
+
+        st.session_state["_charts_layout_inited"] = True
+
+    # Récupérer les placeholders persistants
+    global_ts_ph = st.session_state["_global_ts_ph"]
+    snapshot_ph = st.session_state["_snapshot_ph"]
+    gauge_ph = st.session_state["_gauge_ph"]
+
+    import uuid
+    if "sim_uid" not in st.session_state:
+        st.session_state.sim_uid = f"sim_{uuid.uuid4().hex[:8]}"
+    if "sim_iter" not in st.session_state:
+        st.session_state.sim_iter = 0
+
+    uid = st.session_state.sim_uid
+
+    SNAPSHOT_STEPS = 10  # window length for the snapshot chart
+
+    #global_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
+    palette = ["#000000", "#003366", "#009999", "#006600", "#66CC66",
+               "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"]
+    sensor_color_map = {c: palette[i % len(palette)] for i, c in enumerate(sensor_cols)}
+    sliding_window_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
+    global_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
+
+    # -------- 6) main loop ---------------------------------------------------
+    use_model = model is not None
+    if use_model:
+        model.eval()
+
+    for current_time in list(common_index):
+        st.session_state.sim_iter += 1
+        iter_key = st.session_state.sim_iter
+        # Ensure Timestamp
+        current_time = pd.Timestamp(current_time)
+
+        # (optional) your earlier guards
+        if current_time.time().strftime("%H:%M:%S") == "00:00:00":
+            continue
+
+        # --- values & statuses for this tick ---
+        svals: list = []
+        sstatus: list = []  # True=Real, False=Predicted
+
+        # build rolling historical window strictly before current_time
+        hist_end = current_time - pd.Timedelta(hours=1)
+        if hist_end in missing_df.index:
+            hist_idx = missing_df.loc[:hist_end].index[-window_hours:]
+        else:
+            hist_idx = missing_df.index[missing_df.index < current_time][-window_hours:]
+        hist_win = missing_df.loc[hist_idx, sensor_cols] if len(hist_idx) > 0 else pd.DataFrame()
+
+        # --- DÉBUT : bloc à remplacer (append / assign avec trace d’imputation) ---
+        for col in sensor_cols:
+            v = missing_df.at[current_time, col]
+
+            if pd.isna(v):
+                # fenêtre d'historique déjà calculée: hist_win
+                if not hist_win.empty:
+                    if use_model:
+                        try:
+                            target_idx = col_to_idx[col]
+                            pred_val = predict_single_missing_value(
+                                historical_window=np.asarray(hist_win.values, dtype=np.float32),
+                                target_sensor_index=target_idx,
+                                model=model,
+                                scaler=scaler,
+                                inv_scaler=inv_scaler,
+                                device=device,
+                            )
+                        except Exception:
+                            # fallback robuste: dernière valeur observée
+                            last = pd.to_numeric(hist_win[col].dropna(), errors="coerce")
+                            pred_val = float(last.iloc[-1]) if len(last) else np.nan
+                    else:
+                        # pas de modèle: fallback dernière valeur observée
+                        last = pd.to_numeric(hist_win[col].dropna(), errors="coerce")
+                        pred_val = float(last.iloc[-1]) if len(last) else np.nan
+
+                    # --- assign (dans le buffer de données) ---
+                    missing_df.at[current_time, col] = pred_val if pd.notna(pred_val) else np.nan
+                    # --- append (dans les tableaux pour graphes) ---
+                    svals.append(pred_val if pd.notna(pred_val) else np.nan)
+                    sstatus.append(False)  # False = non-réel (imputé)
+                    # --- trace d’imputation ---
+                    imputed_mask.at[current_time, col] = pd.notna(pred_val)
+
+                else:
+                    # aucune histoire -> on laisse le trou (NaN)
+                    svals.append(np.nan)
+                    sstatus.append(False)
+                    imputed_mask.at[current_time, col] = False
+
+            else:
+                # valeur réelle
+                svals.append(v)
+                sstatus.append(True)
+                imputed_mask.at[current_time, col] = False
+        # --- FIN : bloc à remplacer ---
+
+        # --- append to buffers (for charts) ---
+        row_dict = {"datetime": current_time}
+        for i, col in enumerate(sensor_cols):
+            row_dict[col] = svals[i]
+        sliding_window_df = pd.concat([sliding_window_df, pd.DataFrame([row_dict])], ignore_index=True)
+        global_df        = pd.concat([global_df,        pd.DataFrame([row_dict])], ignore_index=True)
+
+        if len(sliding_window_df) > SNAPSHOT_STEPS:
+            sliding_window_df = sliding_window_df.tail(SNAPSHOT_STEPS)
+
+        # --- map layer update ---
+        vals_by_col  = {col: svals[i]  for i, col in enumerate(sensor_cols)}
+        real_by_col  = {col: sstatus[i] for i, col in enumerate(sensor_cols)}
+
+        tick_df = latlng.copy()
+        tick_df["value"]  = tick_df["data_col"].map(vals_by_col).fillna("NA")
+        tick_df["status"] = tick_df["data_col"].map(lambda c: "Real" if real_by_col.get(c, False) else "Predicted")
+        tick_df["bg_color"] = [GREEN if s == "Real" else RED for s in tick_df["status"]]
+        tick_df["bg_radius"] = 10
+        tick_df["icon"] = [ICON_SPEC] * len(tick_df)
+        tick_df["icon_size"] = 1.0
+
+        st.session_state.deck_obj.layers = [make_bg_layer(tick_df), make_icon_layer(tick_df)]
+        time_slot.markdown(f"**Current Time:** {current_time}")
+        graph_placeholder.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
+
+        # --- sliding 10-step chart (color red if any imputed in segment) ---
+        # --- SNAPSHOT : lignes neutres + marqueurs colorés par point (imputé = rouge) ---
+        sliding_fig = go.Figure()
+        for i, col in enumerate(sensor_cols):
+            base_color = sensor_color_map[col]
+            sub = sliding_window_df[["datetime", col]].dropna().copy()
+            if sub.empty:
+                continue
+
+            # 1) ligne (couleur base) pour la forme
+            sliding_fig.add_trace(go.Scatter(
+                x=sub["datetime"], y=sub[col],
+                mode="lines",
+                line=dict(color=base_color, width=2),
+                name=f"{col} line", showlegend=False
+            ))
+
+            # 2) points réels (non imputés)
+            real_mask_points = ~imputed_mask.loc[sub["datetime"], col].values
+            if real_mask_points.any():
+                sliding_fig.add_trace(go.Scatter(
+                    x=sub["datetime"][real_mask_points],
+                    y=sub[col][real_mask_points],
+                    mode="markers",
+                    marker=dict(size=6, color=base_color),
+                    name=f"{col} real", showlegend=False
+                ))
+
+            # 3) points imputés (rouges)
+            imp_mask_points = imputed_mask.loc[sub["datetime"], col].values
+            if imp_mask_points.any():
+                sliding_fig.add_trace(go.Scatter(
+                    x=sub["datetime"][imp_mask_points],
+                    y=sub[col][imp_mask_points],
+                    mode="markers",
+                    marker=dict(size=7, color="red"),
+                    name=f"{col} imputed", showlegend=False
+                ))
+
+        # Légende compacte (couleurs capteurs + point rouge générique)
+        for col in sensor_cols:
+            sliding_fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode='markers',
+                marker=dict(size=8, color=sensor_color_map[col]),
+                showlegend=True, name=f"Sensor {col}"
+            ))
+        sliding_fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode='markers',
+            marker=dict(size=8, color="red"),
+            showlegend=True, name="Imputed point"
+        ))
+        sliding_fig.update_layout(
+            title="10-Step Snapshot",
+            xaxis_title="Time", yaxis_title="Sensor Value",
+            margin=dict(l=20, r=20, t=40, b=20),
+            legend_title="Sensors"
+        )
+
+        # --- global time series + gauge ---
+        full_ts_fig = draw_full_time_series_with_mask(global_df.copy(), imputed_mask, sensor_cols, sensor_color_map)
+
+        # --- Gauge : % imputé maintenant + delta vs % manquant d’origine ---
+        orig = sim_df.loc[:current_time, sensor_cols]  # avant imputation (NaN d’origine)
+        after = missing_df.loc[:current_time, sensor_cols]  # après imputation (valeurs imputées)
+
+        total_cells = int(after.size)
+
+        # 1) % manquant d’origine
+        orig_missing_mask = orig.isna()
+        orig_missing_count = int(orig_missing_mask.sum().sum())
+        orig_missing_pct = (orig_missing_count / total_cells * 100) if total_cells > 0 else 0.0
+
+        # 2) % manquant maintenant (au cas où tout n'est pas imputable)
+        now_missing_count = int(after.isna().sum().sum())
+        now_missing_pct = (now_missing_count / total_cells * 100) if total_cells > 0 else 0.0
+
+        # 3) % imputé maintenant (trace via imputed_mask)
+        imputed_count = int(imputed_mask.loc[:current_time, sensor_cols].sum().sum())
+        imputed_pct = (imputed_count / total_cells * 100) if total_cells > 0 else 0.0
+
+        gauge_fig = go.Figure(go.Indicator(
+            mode="gauge+number+delta",
+            value=imputed_pct,  # <- ce qu’on affiche: % IMPUTÉ
+            delta={
+                "reference": orig_missing_pct,  # delta vs % manquant d’origine
+                "relative": False,
+                "increasing": {"color": "green"},  # plus on impute, mieux c’est
+                "decreasing": {"color": "red"},
+                "valueformat": ".1f",
+            },
+            title={"text": f"Imputed (%) • Now missing: {now_missing_pct:.1f}%"},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"color": "green" if imputed_pct < DEFAULT_VALUES["gauge_red_max"] else "red"},
+                "steps": [
+                    {"range": [DEFAULT_VALUES["gauge_green_min"], DEFAULT_VALUES["gauge_green_max"]],
+                     "color": "lightgreen"},
+                    {"range": [DEFAULT_VALUES["gauge_yellow_min"], DEFAULT_VALUES["gauge_yellow_max"]],
+                     "color": "yellow"},
+                    {"range": [DEFAULT_VALUES["gauge_red_min"], DEFAULT_VALUES["gauge_red_max"]], "color": "red"},
+                ],
+            },
+        ))
+        gauge_fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
+
+        # keep user zoom/selection across updates
+        sliding_fig.update_layout(uirevision="snapshot")
+        full_ts_fig.update_layout(uirevision="global")
+        gauge_fig.update_layout(uirevision="gauge")
+
+        # clear then re-render — no keys needed
+        snapshot_ph.empty()
+        global_ts_ph.empty()
+        gauge_ph.empty()
+
+        # per-tick unique keys -> no collisions within a single run
+        snapshot_ph.plotly_chart(sliding_fig, use_container_width=True, key=f"{uid}_snapshot_{iter_key}")
+        global_ts_ph.plotly_chart(full_ts_fig, use_container_width=True, key=f"{uid}_global_{iter_key}")
+        gauge_ph.plotly_chart(gauge_fig, use_container_width=True, key=f"{uid}_gauge_{iter_key}")
+
+        # pacing
+        time.sleep(1)
+
+
