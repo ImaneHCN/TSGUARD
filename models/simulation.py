@@ -610,9 +610,8 @@ def train_model(train_file, missing_file, positions_file, epochs, model_path):
         avg_train_loss += epoch_loss
 
         progress_bar.progress(int((epoch + 1) * 100 / max(epochs, 1)))
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            with status_container:
-                st.write(f"🔹 **Epoch {epoch + 1}** | 📉 **Loss:** `{epoch_loss:.4f}`")
+        with status_container:
+            st.write(f"🔹 **Epoch {epoch + 1}** | 📉 **Loss:** `{epoch_loss:.4f}`")
 
     avg_train_loss /= max(epochs, 1)
 
@@ -1440,6 +1439,9 @@ def run_simulation_with_live_imputation(
     sim_df.set_index("datetime", inplace=True)
     missing_df.set_index("datetime", inplace=True)
 
+    sim_df = sim_df[~sim_df.index.duplicated(keep="first")].copy()
+    missing_df = missing_df[~missing_df.index.duplicated(keep="first")].copy()
+
     common_index = sim_df.index.intersection(missing_df.index)
     if common_index.empty or latlng.empty:
         st.info("No matching timeline or positions/sensors. Nothing to display.")
@@ -1632,61 +1634,62 @@ def run_simulation_with_live_imputation(
         graph_placeholder.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
 
         # --- sliding 10-step chart (color red if any imputed in segment) ---
-        # --- SNAPSHOT : lignes neutres + marqueurs colorés par point (imputé = rouge) ---
+
         sliding_fig = go.Figure()
-        for i, col in enumerate(sensor_cols):
+
+        for col in sensor_cols:
             base_color = sensor_color_map[col]
+
+            # Take the window, ensure order, and drop NaNs for plotting
             sub = sliding_window_df[["datetime", col]].dropna().copy()
             if sub.empty:
                 continue
+            sub.sort_values("datetime", inplace=True)
 
-            # 1) ligne (couleur base) pour la forme
-            sliding_fig.add_trace(go.Scatter(
-                x=sub["datetime"], y=sub[col],
-                mode="lines",
-                line=dict(color=base_color, width=2),
-                name=f"{col} line", showlegend=False
-            ))
+            # Walk consecutive pairs and draw a small segment each time.
+            prev_x = prev_y = prev_imp = None
+            for x, y in zip(sub["datetime"], sub[col]):
+                # this timestamp is in common_index, so safe to access imputed_mask
+                imp = bool(imputed_mask.loc[x, col]) if x in imputed_mask.index else False
 
-            # 2) points réels (non imputés)
-            real_mask_points = ~imputed_mask.loc[sub["datetime"], col].values
-            if real_mask_points.any():
+                if prev_x is None:
+                    prev_x, prev_y, prev_imp = x, y, imp
+                    continue
+
+                # SEGMENT COLOR: red if either endpoint is imputed
+                seg_color = "red" if (imp or prev_imp) else base_color
+
                 sliding_fig.add_trace(go.Scatter(
-                    x=sub["datetime"][real_mask_points],
-                    y=sub[col][real_mask_points],
-                    mode="markers",
-                    marker=dict(size=6, color=base_color),
-                    name=f"{col} real", showlegend=False
+                    x=[prev_x, x],
+                    y=[prev_y, y],
+                    mode="lines+markers",
+                    line=dict(width=2, color=seg_color),
+                    marker=dict(size=6, color=seg_color),
+                    showlegend=False,
                 ))
 
-            # 3) points imputés (rouges)
-            imp_mask_points = imputed_mask.loc[sub["datetime"], col].values
-            if imp_mask_points.any():
-                sliding_fig.add_trace(go.Scatter(
-                    x=sub["datetime"][imp_mask_points],
-                    y=sub[col][imp_mask_points],
-                    mode="markers",
-                    marker=dict(size=7, color="red"),
-                    name=f"{col} imputed", showlegend=False
-                ))
+                prev_x, prev_y, prev_imp = x, y, imp
 
-        # Légende compacte (couleurs capteurs + point rouge générique)
+        # Legend (sensor colors + generic red for "Imputed segment")
         for col in sensor_cols:
             sliding_fig.add_trace(go.Scatter(
-                x=[None], y=[None], mode='markers',
+                x=[None], y=[None], mode="markers",
                 marker=dict(size=8, color=sensor_color_map[col]),
                 showlegend=True, name=f"Sensor {col}"
             ))
         sliding_fig.add_trace(go.Scatter(
-            x=[None], y=[None], mode='markers',
+            x=[None], y=[None], mode="markers",
             marker=dict(size=8, color="red"),
-            showlegend=True, name="Imputed point"
+            showlegend=True, name="Imputed segment"
         ))
+
         sliding_fig.update_layout(
             title="10-Step Snapshot",
-            xaxis_title="Time", yaxis_title="Sensor Value",
+            xaxis_title="Time",
+            yaxis_title="Sensor Value",
             margin=dict(l=20, r=20, t=40, b=20),
-            legend_title="Sensors"
+            legend_title="Sensors",
+            uirevision="snapshot",  # keep zoom/legend across updates
         )
 
         # --- global time series + gauge ---
