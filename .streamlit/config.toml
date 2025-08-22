@@ -4,3 +4,6 @@ primaryColor="#ff4b8b"        # rose fuchsia
 backgroundColor="#fff5f8"     # fond légèrement rosé
 secondaryBackgroundColor="#ffe3ec"  # panneaux rosés
 textColor="#262730"
+[server]
+fileWatcherType = "none"
+

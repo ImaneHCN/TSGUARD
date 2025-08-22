@@ -83,6 +83,18 @@ def main():
     # Load required files
     tr, df, pf, sensor_list = helper.init_files(training_data_file, sensor_data_file, positions_file)
 
+    # after init_files(...)
+    gref = tr.copy()
+    if "datetime" not in gref.columns:
+        gref = gref.reset_index().rename(columns={"index": "datetime"})
+    gref["datetime"] = pd.to_datetime(gref["datetime"], errors="coerce").dt.floor("h")
+    gref = gref.dropna(subset=["datetime"]).set_index("datetime")
+
+    # ensure 6-digit sensor names
+    gref.columns = [c if not str(c).isdigit() else str(c).zfill(6) for c in gref.columns]
+
+    st.session_state["ground_ref"] = gref
+
     # init streamlit state variables
     helper.init_states(tr, df, pf)
     
