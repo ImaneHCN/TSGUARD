@@ -2,7 +2,7 @@ DEFAULT_VALUES = {
     # Signma Threshold
     "sigma_threshold": 10,
     # Graph Size
-    "graph_size": 10,
+    "graph_size": 36,
     # System State Threshold
     "gauge_green_min": 0,
     "gauge_green_max": 20,

@@ -1,5 +1,4 @@
 import pickle
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -1348,7 +1347,7 @@ def render_pristi_window_plus_mse(
     # ----- PriSTI window (on n’affiche plus la fenêtre TSGuard)
     fig_pri = go.Figure()
     fig_pri.update_layout(
-        title=f"PriSTI — 36 steps {title_suffix}",
+        title=None,
         xaxis_title="Time", yaxis_title="Sensor value",
         margin=dict(l=10, r=10, t=40, b=10),
         uirevision="pristi_only",
@@ -1400,30 +1399,26 @@ def run_simulation_with_live_imputation(
     scaler: callable,
     inv_scaler: callable,
     device: torch.device,
-    graph_placeholder,
-    sliding_chart_placeholder,
-    gauge_placeholder,
+    graph_placeholder,              # placeholder de la carte (ou None)
+    sliding_chart_placeholder,      # inutilisé mais conservé pour compatibilité
+    gauge_placeholder,              # inutilisé mais conservé pour compatibilité
     window_hours: int = 24,
 ):
+    """
+    Simulation + imputation en direct.
+    - En-tête (titre + heure + bouton) AU-DESSUS de la carte.
+    - Carte pydeck juste en dessous.
+    - Fenêtre séparée (expander) pour la comparaison Snapshot 36 : TSGUARD / PRISTI.
+    """
 
-    """
-    Streamed simulation with live, single-point imputation.
-    - At each timestamp and for each sensor col:
-        * if missing_df value is NaN -> predict (or fallback) using a rolling window
-          from *missing_df* (which accumulates prior imputations), then write back.
-        * else use the real value.
-    - Map: green=Real, red=Predicted.
-    - Gauge: % originally missing (from sim_df) up to 'now'.
-    """
-    import time
+    import os, time, uuid
     import numpy as np
     import pandas as pd
     import plotly.graph_objects as go
     import pydeck as pdk
     import streamlit as st
 
-
-    # -------- helpers: mapping & view fit ------------------------------------
+    # ---------- Utilitaires internes ----------
     def zpad6(s: str) -> str:
         return s if not s.isdigit() else s.zfill(6)
 
@@ -1431,8 +1426,8 @@ def run_simulation_with_live_imputation(
         t = s.lstrip("0")
         return t if t else "0"
 
-    GREEN = [46, 204, 113, 200]   # Real
-    RED   = [231, 76, 60, 200]    # Predicted
+    GREEN = [46, 204, 113, 200]   # réel
+    RED   = [231, 76, 60, 200]    # imputé
 
     def make_bg_layer(df):
         return pdk.Layer(
@@ -1451,7 +1446,6 @@ def run_simulation_with_live_imputation(
         )
 
     def make_icon_layer(df):
-        # ICON_SPEC should exist at module level; if not, fall back to size-only points
         return pdk.Layer(
             "IconLayer",
             data=df,
@@ -1476,15 +1470,12 @@ def run_simulation_with_live_imputation(
         zoom = max(1.0, min(16.0, np.log2(360.0 / span)))
         return pdk.ViewState(latitude=lat_c, longitude=lon_c, zoom=zoom, bearing=0, pitch=0)
 
-    # -------- 0) choose sensor set ------------------------------------------
-    if st.session_state.get("_sim_active", False):
-        st.stop()
-    st.session_state["_sim_active"] = True
+    # ---------- Sélection des capteurs ----------
     all_sensor_cols = [c for c in sim_df.columns if c != "datetime"]
     graph_size = int(st.session_state.get("graph_size", DEFAULT_VALUES["graph_size"]))
     sensor_cols = [str(c) for c in all_sensor_cols[:graph_size]]
 
-    # -------- 1) normalize/prepare positions and align to sensor_cols --------
+    # ---------- Positions & mapping capteurs ----------
     latlng_raw = positions_to_df(positions).copy()
     latlng_raw["sensor_id"] = latlng_raw["sensor_id"].astype(str).str.strip()
     latlng_raw["latitude"]  = pd.to_numeric(latlng_raw["latitude"],  errors="coerce")
@@ -1493,17 +1484,13 @@ def run_simulation_with_live_imputation(
 
     pos_ids = latlng_raw["sensor_id"].tolist()
 
-    # mapping strategies
     map_exact  = {pid: pid for pid in pos_ids if pid in sensor_cols}
     map_pad6   = {pid: zpad6(pid) for pid in pos_ids if zpad6(pid) in sensor_cols}
     map_strip0 = {}
     for pid in pos_ids:
-        s  = strip0(pid)
-        s6 = zpad6(s)
-        if s in sensor_cols:
-            map_strip0[pid] = s
-        elif s6 in sensor_cols:
-            map_strip0[pid] = s6
+        s  = strip0(pid); s6 = zpad6(s)
+        if s in sensor_cols:    map_strip0[pid] = s
+        elif s6 in sensor_cols: map_strip0[pid] = s6
 
     map_index = {}
     if all(p.isdigit() for p in pos_ids):
@@ -1522,54 +1509,35 @@ def run_simulation_with_live_imputation(
     latlng = latlng_raw.copy()
     latlng["data_col"] = latlng["sensor_id"].map(best_map)
     latlng = latlng[latlng["data_col"].notna()].copy()
-
     order_index = {c: i for i, c in enumerate(sensor_cols)}
     latlng["__ord"] = latlng["data_col"].map(order_index)
     latlng = latlng.sort_values("__ord").drop(columns="__ord").reset_index(drop=True)
 
-    # keep only mapped sensors, preserve order
+    # garde l’ordre existant
     sensor_cols = [c for c in sensor_cols if c in set(latlng["data_col"])]
     if not sensor_cols:
         st.info("After mapping, no sensors remain to plot.")
         return
-
-    # quick index lookup for model target
     col_to_idx = {c: i for i, c in enumerate(sensor_cols)}
 
-    # -------- 2) align time indexes (hourly) --------------------------------
-    sim_df     = sim_df.copy()
-    missing_df = missing_df.copy()
-
-    missingness_number = int (0)
-    arrived_values_number = int(0)
-
-
-    # --- ensure a 'datetime' column exists in both dataframes ---
+    # ---------- Alignement temporel ----------
     def ensure_datetime_column(df: pd.DataFrame, name: str) -> pd.DataFrame:
         if "datetime" in df.columns:
             return df
-        # if the index is already datetime, turn it into a column
         if isinstance(df.index, pd.DatetimeIndex):
-            out = df.reset_index().rename(columns={"index": "datetime"})
-            return out
-        # common alternate names
+            return df.reset_index().rename(columns={"index": "datetime"})
         for alt in ("timestamp", "date", "time"):
             if alt in df.columns:
-                out = df.rename(columns={alt: "datetime"})
-                return out
-        # last resort: try parsing an index that looks like datetimes
+                return df.rename(columns={alt: "datetime"})
         try:
             idx_as_dt = pd.to_datetime(df.index, errors="raise")
             out = df.reset_index().rename(columns={"index": "datetime"})
             out["datetime"] = idx_as_dt
             return out
         except Exception:
-            raise KeyError(
-                f"{name} has no 'datetime' column or datetime-like index. "
-                f"Columns: {list(df.columns)[:8]}"
-            )
+            raise KeyError(f"{name} has no 'datetime' column or datetime-like index.")
 
-    sim_df = ensure_datetime_column(sim_df, "sim_df")
+    sim_df     = ensure_datetime_column(sim_df, "sim_df")
     missing_df = ensure_datetime_column(missing_df, "missing_df")
 
     sim_df["datetime"]     = pd.to_datetime(sim_df["datetime"], errors="coerce")
@@ -1581,70 +1549,71 @@ def run_simulation_with_live_imputation(
     missing_df["datetime"] = missing_df["datetime"].dt.floor("h")
     sim_df.set_index("datetime", inplace=True)
     missing_df.set_index("datetime", inplace=True)
-
-    sim_df = sim_df[~sim_df.index.duplicated(keep="first")].copy()
+    sim_df     = sim_df[~sim_df.index.duplicated(keep="first")].copy()
     missing_df = missing_df[~missing_df.index.duplicated(keep="first")].copy()
-    # freeze "originally missing" from the live/missing file BEFORE we mutate it
+
     if "orig_missing_baseline" not in st.session_state:
         st.session_state.orig_missing_baseline = missing_df.isna().copy()
     else:
-        # if the timeline changes (new uploads), refresh the baseline
-        if not st.session_state.orig_missing_baseline.index.equals(missing_df.index) or \
-                list(st.session_state.orig_missing_baseline.columns) != list(missing_df.columns):
+        if (not st.session_state.orig_missing_baseline.index.equals(missing_df.index) or
+            list(st.session_state.orig_missing_baseline.columns) != list(missing_df.columns)):
             st.session_state.orig_missing_baseline = missing_df.isna().copy()
 
-    baseline_missing_mask = st.session_state.orig_missing_baseline  # shortcut
-
-    base_index = missing_df.index
-    sim_df = sim_df.reindex(base_index)  # keeps sim_df for “originally missing” info
+    base_index   = missing_df.index
+    sim_df       = sim_df.reindex(base_index)
     common_index = base_index
-
     if common_index.empty or latlng.empty:
         st.info("No matching timeline or positions/sensors. Nothing to display.")
         return
 
-    # --- trace des points imputés (même index/colonnes que les données) ---
-    imputed_mask = pd.DataFrame(False, index=common_index, columns=sensor_cols, dtype=bool)
-
-    sim_df     = sim_df.loc[common_index].sort_index()
-    missing_df = missing_df.loc[common_index].sort_index()
-    # ---- PriSTI setup ----
+    # ---------- PriSTI (optionnel) ----------
     PRISTI_ROOT = "./PriSTI"
     CONFIG_PATH = f"{PRISTI_ROOT}/config/base.yaml"
     WEIGHTS_PATH = f"{PRISTI_ROOT}/save/aqi36/model.pth"
-    MEANSTD_PK = f"{PRISTI_ROOT}/data/pm25/pm25_meanstd.pk"
+    MEANSTD_PK   = f"{PRISTI_ROOT}/data/pm25/pm25_meanstd.pk"
 
-    all_cols_for_pristi = list(missing_df.columns)  # toutes les colonnes alignées temporellement
+    all_cols_for_pristi = list(missing_df.columns)
     have_36 = len(all_cols_for_pristi) >= 36
     have_cfg = os.path.exists(CONFIG_PATH)
     have_wts = os.path.exists(WEIGHTS_PATH)
-    have_ms = os.path.exists(MEANSTD_PK)
+    have_ms  = os.path.exists(MEANSTD_PK)
 
-    if not (have_36 and have_cfg and have_wts and have_ms):
-        reasons = []
-        if not have_36: reasons.append("≥36 capteurs requis")
-        if not have_cfg: reasons.append("config manquante")
-        if not have_wts: reasons.append("poids manquants")
-        if not have_ms:  reasons.append("mean/std manquants")
-        st.warning("PriSTI désactivé — " + ", ".join(reasons))
-        pristi_enabled = False
-    else:
-        pristi_enabled = True
-        pristi_cols = all_cols_for_pristi[:36]  # PriSTI = exactement 36
+    pristi_enabled = have_36 and have_cfg and have_wts and have_ms
+    if pristi_enabled:
+        pristi_cols = all_cols_for_pristi[:36]
         pristi_model, pristi_mean, pristi_std = load_pristi_artifacts(CONFIG_PATH, WEIGHTS_PATH, MEANSTD_PK, device)
         st.session_state["pristi_model"] = pristi_model
-        st.session_state["pristi_mean"] = pristi_mean
-        st.session_state["pristi_std"] = pristi_std
+        st.session_state["pristi_mean"]  = pristi_mean
+        st.session_state["pristi_std"]   = pristi_std
         if "pristi_running_df" not in st.session_state:
-            st.session_state["pristi_running_df"] = missing_df.copy()  # DF séparé pour PriSTI
+            st.session_state["pristi_running_df"] = missing_df.copy()
+    else:
+        miss = []
+        if not have_36: miss.append("≥36 capteurs requis")
+        if not have_cfg: miss.append("config manquante")
+        if not have_wts: miss.append("poids manquants")
+        if not have_ms:  miss.append("mean/std manquants")
+        if miss:
+            st.warning("PriSTI désactivé — " + ", ".join(miss))
 
-    # -------- 3) header slot + persistent deck.gl map -----------------------
-    map_container = st.container()
-    with map_container:
-        st.markdown("### Sensor Simulation Graph")
-        time_slot = st.empty()
+    # ===================== EN-TÊTE AU-DESSUS DE LA CARTE ======================
+    st.markdown("### Sensor Simulation Graph")
 
-    # fall back icon spec if not present
+    col_l, col_r = st.columns([7, 2])
+    with col_l:
+        # placeholder heure (init '—')
+        time_slot = st.markdown(
+            "<div style='font-weight:600;margin-bottom:6px'>Current Time: —</div>",
+            unsafe_allow_html=True
+        )
+    with col_r:
+        fit_clicked = st.button("Fit map to sensors", key="fit_to_sensors_btn", use_container_width=True)
+
+    # map juste en dessous (petite marge)
+    st.markdown("<div style='margin-bottom:6px'></div>", unsafe_allow_html=True)
+    map_ph = graph_placeholder if graph_placeholder is not None else st.empty()
+
+    # ===================== CARTE (initialisation sûre) ========================
     global ICON_SPEC
     if "ICON_SPEC" not in globals() or ICON_SPEC is None:
         ICON_SPEC = {"url": "", "width": 1, "height": 1, "anchorX": 0, "anchorY": 0}
@@ -1654,107 +1623,90 @@ def run_simulation_with_live_imputation(
         base_df["sensor_id"] = base_df["sensor_id"].astype(str)
         base_df["value"] = "NA"
         base_df["status"] = "Predicted"
-        base_df["bg_color"] = [RED for _ in range(len(base_df))]
+        base_df["bg_color"] = [[231, 76, 60, 200] for _ in range(len(base_df))]
         base_df["bg_radius"] = 10
         base_df["icon"] = [ICON_SPEC] * len(base_df)
         base_df["icon_size"] = 1.0
+        st.session_state._fit_base_df = base_df.copy()
 
         initial_view = fit_view_simple(base_df)
-
         st.session_state.deck_obj = pdk.Deck(
             layers=[make_bg_layer(base_df), make_icon_layer(base_df)],
             initial_view_state=initial_view,
             map_style="mapbox://styles/mapbox/light-v11",
             tooltip={"text": "Sensor {sensor_id}\nValue: {value}\nStatus: {status}"},
         )
-        graph_placeholder.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
-        st.session_state._fit_base_df = base_df.copy()
 
-    ctrl_col1, _ = st.columns([1, 5])
-    with ctrl_col1:
-        if st.button("Fit map to sensors", key="fit_to_sensors_btn"):
-            st.session_state.deck_obj.initial_view_state = fit_view_simple(st.session_state._fit_base_df)
-            graph_placeholder.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
+    if fit_clicked:
+        st.session_state.deck_obj.initial_view_state = fit_view_simple(st.session_state._fit_base_df)
 
+    # Render initial map
+    map_ph.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
+
+
+
+    # ===================== AUTRES ZONES (gauge + global TS) ===================
     if not st.session_state.get("_charts_layout_inited", False):
         st.markdown("---")
-        # Ligne 1 : Gauge (gauche) + Global TS (droite)
-        col_left, col_right = st.columns([1, 3])
-        with col_left:
+        cL, cR = st.columns([1, 3])
+        with cL:
             st.subheader("Missed Data (%)")
             st.session_state["_gauge_ph"] = st.empty()
-        with col_right:
+        with cR:
             st.subheader("Global Time Series")
             st.session_state["_global_ts_ph"] = st.empty()
-
-        st.markdown("---")
-        # Ligne 2 : Snapshot 36 (plein écran)
-        st.subheader("TSGuard — fenêtre glissante (36)")
-        st.session_state["_snapshot36_ph"] = st.empty()
-
-        # Ligne 3 : PriSTI (plein écran)
-        st.subheader("PriSTI — fenêtre glissante (36)")
-        st.session_state["_pristi_cmp_ph"] = st.empty()
-
         st.session_state["_charts_layout_inited"] = True
 
-    global_ts_ph = st.session_state["_global_ts_ph"]
-    snapshot_ph = st.session_state["_snapshot36_ph"]
-    gauge_ph = st.session_state["_gauge_ph"]
-    pristi_cmp_ph = st.session_state["_pristi_cmp_ph"]
+        # ===================== FENÊTRE SÉPARÉE — SNAPSHOT 36 ======================
+        if not st.session_state.get("_cmp_layout_inited", False):
+            st.markdown("---")
+            with st.expander("Comparaison — Snapshot 36", expanded=False):
+                st.subheader("Snapshot 36")
+                st.caption("TSGUARD")
+                ph_tsg = st.empty()
+                st.caption("PRISTI")
+                ph_pri = st.empty()
+            st.session_state["_snapshot36_ph"] = ph_tsg
+            st.session_state["_pristi_cmp_ph"] = ph_pri
+            st.session_state["_cmp_layout_inited"] = True
 
-    import uuid
+    # Raccourcis placeholders
+    snapshot_ph  = st.session_state["_snapshot36_ph"]
+    pristi_ph    = st.session_state["_pristi_cmp_ph"]
+    gauge_ph     = st.session_state["_gauge_ph"]
+    global_ts_ph = st.session_state["_global_ts_ph"]
+
+    # ===================== Buffers & couleurs ================================
     if "sim_uid" not in st.session_state:
         st.session_state.sim_uid = f"sim_{uuid.uuid4().hex[:8]}"
     if "sim_iter" not in st.session_state:
         st.session_state.sim_iter = 0
-
     uid = st.session_state.sim_uid
 
-    SNAPSHOT_STEPS = 36  # window length for the snapshot chart
-
-    #global_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
+    SNAPSHOT_STEPS = 36
     palette = ["#000000", "#003366", "#009999", "#006600", "#66CC66",
                "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"]
     sensor_color_map = {c: palette[i % len(palette)] for i, c in enumerate(sensor_cols)}
     sliding_window_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
     global_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
 
-    # ---- baseline: originally-missing cells in the live file (fixed) ----
-    # must come after: sensor_cols is final + sim_df/missing_df are aligned
-    baseline = missing_df.reindex(columns=sensor_cols).isna().copy()
+    # masque d’imputation (pour le rendu)
+    imputed_mask = pd.DataFrame(False, index=common_index, columns=sensor_cols, dtype=bool)
 
-    # create once (or refresh if timeline/columns changed)
-    if ("orig_missing_baseline" not in st.session_state or
-            not st.session_state.orig_missing_baseline.index.equals(baseline.index) or
-            list(st.session_state.orig_missing_baseline.columns) != list(baseline.columns)):
-        st.session_state.orig_missing_baseline = baseline
-        st.session_state.orig_missing_total = int(baseline.values.sum())
-
-    # always read through a safe local variable
-    orig_missing_total = int(st.session_state.get("orig_missing_total", int(baseline.values.sum())))
-
-    # -------- 6) main loop ---------------------------------------------------
-    global_values_number = 0
-    missed_values_number = 0
-
+    # ===================== Boucle principale =================================
+    arrived_values_number = 0
+    missingness_number = 0
     use_model = model is not None
     if use_model:
         model.eval()
 
     for current_time in list(common_index):
-        arrived_values_number=arrived_values_number+1
+        arrived_values_number += 1
         st.session_state.sim_iter += 1
         iter_key = st.session_state.sim_iter
-        # Ensure Timestamp
         current_time = pd.Timestamp(current_time)
 
-
-        # --- values & statuses for this tick ---
-        svals: list = []
-        sstatus: list = []  # True=Real, False=Predicted
-
-        # build rolling historical window strictly before current_time
+        # Fenêtre historique
         hist_end = current_time - pd.Timedelta(hours=1)
         if hist_end in missing_df.index:
             hist_idx = missing_df.loc[:hist_end].index[-window_hours:]
@@ -1762,14 +1714,11 @@ def run_simulation_with_live_imputation(
             hist_idx = missing_df.index[missing_df.index < current_time][-window_hours:]
         hist_win = missing_df.loc[hist_idx, sensor_cols] if len(hist_idx) > 0 else pd.DataFrame()
 
-        # --- DÉBUT : (append / assign avec trace d’imputation) ---
+        # Valeurs du tick
+        svals, sstatus = [], []
         for col in sensor_cols:
             v = missing_df.at[current_time, col]
-            global_values_number=global_values_number+1
-
             if pd.isna(v):
-                missed_values_number = missed_values_number+1
-                # fenêtre d'historique déjà calculée: hist_win
                 if not hist_win.empty:
                     if use_model:
                         try:
@@ -1777,105 +1726,81 @@ def run_simulation_with_live_imputation(
                             pred_val = predict_single_missing_value(
                                 historical_window=np.asarray(hist_win.values, dtype=np.float32),
                                 target_sensor_index=target_idx,
-                                model=model,
-                                scaler=scaler,
-                                inv_scaler=inv_scaler,
-                                device=device,
+                                model=model, scaler=scaler, inv_scaler=inv_scaler, device=device
                             )
                         except Exception:
-                            # fallback robuste: dernière valeur observée
                             last = pd.to_numeric(hist_win[col].dropna(), errors="coerce")
                             pred_val = float(last.iloc[-1]) if len(last) else np.nan
                     else:
-                        # pas de modèle: fallback dernière valeur observée
                         last = pd.to_numeric(hist_win[col].dropna(), errors="coerce")
                         pred_val = float(last.iloc[-1]) if len(last) else np.nan
 
-                    # --- assign (dans le buffer de données) ---
                     missing_df.at[current_time, col] = pred_val if pd.notna(pred_val) else np.nan
-                    # --- append (dans les tableaux pour graphes) ---
                     svals.append(pred_val if pd.notna(pred_val) else np.nan)
-                    sstatus.append(False)  # False = non-réel (imputé)
-                    # --- trace d’imputation ---
+                    sstatus.append(False)  # imputé
                     imputed_mask.at[current_time, col] = pd.notna(pred_val)
-
                 else:
-                    # aucune histoire -> on laisse le trou (NaN)
-                    svals.append(np.nan)
-                    sstatus.append(False)
+                    svals.append(np.nan); sstatus.append(False)
                     imputed_mask.at[current_time, col] = False
-
             else:
-                # valeur réelle
-                svals.append(v)
-                sstatus.append(True)
+                svals.append(v); sstatus.append(True)
                 imputed_mask.at[current_time, col] = False
-        # --- FIN --
 
-        # --- append to buffers (for charts) ---
+        # Buffers pour graphes
         row_dict = {"datetime": current_time}
         for i, col in enumerate(sensor_cols):
             row_dict[col] = svals[i]
-        # instead of concatenating a 1-row DataFrame repeatedly:
-        next_idx = len(sliding_window_df)
-        sliding_window_df.loc[next_idx] = row_dict
+        sliding_window_df.loc[len(sliding_window_df)] = row_dict
         global_df.loc[len(global_df)] = row_dict
-
-        # -----
         if len(sliding_window_df) > SNAPSHOT_STEPS:
             sliding_window_df = sliding_window_df.tail(SNAPSHOT_STEPS)
 
-        # --- PriSTI : imputer à chaque pas dès qu'on a 36 timestamps ---
+        # PriSTI — fenêtre glissante si dispo
         if pristi_enabled:
             try:
                 pristi_running_df = st.session_state["pristi_running_df"]
                 end_loc = pristi_running_df.index.get_loc(current_time)
                 EVAL_LENGTH = 36
-
                 if not isinstance(end_loc, slice) and (end_loc + 1) >= EVAL_LENGTH:
-                    # fenêtre glissante [t-35 ... t]
                     start_loc = end_loc - (EVAL_LENGTH - 1)
                     time_index = pristi_running_df.index[start_loc:end_loc + 1]
 
-                    # imputation PriSTI uniquement sur cette fenêtre
                     updated_df, info = impute_window_with_pristi(
-                        missing_df=pristi_running_df.copy(),  # on lui passe le DF courant
-                        sensor_cols=pristi_cols,  # 36 premiers capteurs
+                        missing_df=pristi_running_df.copy(),
+                        sensor_cols=pristi_cols,
                         target_timestamp=current_time,
                         model=st.session_state["pristi_model"],
-                        device=device,
-                        eval_len=EVAL_LENGTH,
-                        nsample=100,
+                        device=device, eval_len=EVAL_LENGTH, nsample=100
                     )
                     if info == "ok":
-                        # on remplace juste la tranche glissante (sans réécrire l'historique antérieur)
                         pristi_running_df.loc[time_index, pristi_cols] = updated_df.loc[time_index, pristi_cols].values
                         st.session_state["pristi_running_df"] = pristi_running_df
 
-                    # masque « manquant à l'origine » restreint à la fenêtre
+                    # Rendu PRISTI dans la fenêtre séparée (sans titre interne)
                     win_mask_df = st.session_state.orig_missing_baseline.reindex(
-                        index=time_index, columns=pristi_cols
-                    ).fillna(False)
-
-                    # bloc PriSTI de la fenêtre courante
+                        index=time_index, columns=pristi_cols).fillna(False)
                     pristi_block = pristi_running_df.loc[time_index, pristi_cols].copy()
 
-                    # AFFICHAGE : PriSTI plein écran, pas de graphe MSE
-                    render_pristi_window_only(
-                        ph=pristi_cmp_ph,
-                        time_index=time_index,
-                        pristi_cols=pristi_cols,
-                        pristi_block=pristi_block,
-                        win_mask_df=win_mask_df,
-                        title_suffix=f"(fin {time_index[-1]})",
+                    # Construire une figure type "window lines" sans titre
+                    fig_pri = go.Figure()
+                    # réutilise votre _window_lines si dispo; sinon, fallback simple
+                    if "_window_lines" in globals():
+                        palette2 = ["#000000", "#003366", "#009999", "#006600", "#66CC66",
+                                    "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"]
+                        sensor_color_map2 = {c: palette2[i % len(palette2)] for i, c in enumerate(pristi_cols)}
+                        _window_lines(fig_pri, pristi_block, win_mask_df, pristi_cols, sensor_color_map2)
+                    fig_pri.update_layout(
+                        title=None, xaxis_title="Time", yaxis_title="Sensor value",
+                        margin=dict(l=10, r=10, t=30, b=10), uirevision="pri_only",
                     )
+                    pristi_ph.plotly_chart(fig_pri, use_container_width=True, key=f"{uid}_pri_{iter_key}")
 
             except Exception as e:
                 st.caption(f"PriSTI error @ {current_time}: {e}")
 
-        # --- map layer update ---
-        vals_by_col  = {col: svals[i]  for i, col in enumerate(sensor_cols)}
-        real_by_col  = {col: sstatus[i] for i, col in enumerate(sensor_cols)}
+        # ===================== Mise à jour carte + heure ======================
+        vals_by_col = {col: svals[i] for i, col in enumerate(sensor_cols)}
+        real_by_col = {col: sstatus[i] for i, col in enumerate(sensor_cols)}
 
         tick_df = latlng.copy()
         tick_df["value"]  = tick_df["data_col"].map(vals_by_col).fillna("NA")
@@ -1886,114 +1811,95 @@ def run_simulation_with_live_imputation(
         tick_df["icon_size"] = 1.0
 
         st.session_state.deck_obj.layers = [make_bg_layer(tick_df), make_icon_layer(tick_df)]
-        time_slot.markdown(f"**Current Time:** {current_time}")
-        graph_placeholder.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
 
-        # --- sliding 10-step chart (color red if any imputed in segment) ---
+        time_slot.markdown(
+            f"<div style='font-weight:600;margin-bottom:6px'>Current Time: {current_time}</div>",
+            unsafe_allow_html=True
+        )
+        map_ph.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
 
+        # ===================== Snapshot 36 (TSGUARD) ==========================
         sliding_fig = go.Figure()
+        # segments colorés (rouge si un bout imputé)
+        def add_imputed_segments(fig, df_xy, mask_col_bool, base_color, gap_hours=6):
+            GAP = pd.Timedelta(hours=gap_hours)
+            prev_x = prev_y = prev_imp = None
+            for x, y in zip(df_xy["datetime"], df_xy["value"]):
+                imp = bool(mask_col_bool(x))
+                if prev_x is not None:
+                    if x - prev_x > GAP:
+                        prev_x, prev_y, prev_imp = x, y, imp
+                        continue
+                    seg_color = "red" if (imp or prev_imp) else base_color
+                    fig.add_trace(go.Scatter(
+                        x=[prev_x, x], y=[prev_y, y],
+                        mode="lines+markers",
+                        line=dict(width=2, color=seg_color),
+                        marker=dict(size=6, color=seg_color),
+                        showlegend=False,
+                    ))
+                prev_x, prev_y, prev_imp = x, y, imp
 
         for col in sensor_cols:
             base_color = sensor_color_map[col]
-
             sub = (sliding_window_df[["datetime", col]]
-                   .dropna()
-                   .sort_values("datetime")
-                   .rename(columns={col: "value"}))
-
+                   .dropna().sort_values("datetime").rename(columns={col: "value"}))
             if sub.empty:
                 continue
-
-            # function that answers "is this point imputed?"
-            is_imp = lambda t: (t in imputed_mask.index) and bool(imputed_mask.loc[t, col])
-
+            is_imp = lambda t, c=col: (t in imputed_mask.index) and bool(imputed_mask.loc[t, c])
             add_imputed_segments(sliding_fig, sub, is_imp, base_color, gap_hours=6)
 
-        # legend
+        # Légende compacte
         for col in sensor_cols:
-            sliding_fig.add_trace(go.Scatter(
-                x=[None], y=[None], mode='markers',
+            sliding_fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
                 marker=dict(size=8, color=sensor_color_map[col]),
                 showlegend=True, name=f"Sensor {col}"
             ))
-        sliding_fig.add_trace(go.Scatter(
-            x=[None], y=[None], mode='markers',
-            marker=dict(size=8, color="red"),
-            showlegend=True, name="Imputed segment"
+        sliding_fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
+            marker=dict(size=8, color="red"), showlegend=True, name="Imputed segment"
         ))
+
         sliding_fig.update_layout(
-            title="36-Step Snapshot",
-            xaxis_title="Time",
-            yaxis_title="Sensor Value",
-            margin=dict(l=20, r=20, t=40, b=20),
+            title=None,  # un seul titre dans l'expander
+            xaxis_title="Time", yaxis_title="Sensor Value",
+            margin=dict(l=20, r=20, t=30, b=20),
             legend_title="Sensors",
             uirevision="snapshot",
         )
+        snapshot_ph.plotly_chart(sliding_fig, use_container_width=True, key=f"{uid}_snapshot_{iter_key}")
 
-        # --- global time series + gauge ---
-        full_ts_fig = draw_full_time_series_with_mask_gap(global_df.copy(), imputed_mask, sensor_cols, sensor_color_map)
+        # ===================== Global TS + Gauge ==============================
+        full_ts_fig = draw_full_time_series_with_mask_gap(
+            global_df.copy(), imputed_mask, sensor_cols, sensor_color_map)
 
-        # --- Gauge: progress filling originally-missing cells (fixed denominator) ---
-        # --- GAUGE (point-in-time, perfectly in sync with map & snapshot) ---
-        # Use imputed_mask at *current_time* so it's identical to red points/segments you see now
-        row_imp = imputed_mask.reindex(index=[current_time], columns=sensor_cols, fill_value=False).iloc[0]
-        row_miss = missing_df.loc[current_time, sensor_cols].isna()
-
-        sensors_total = len(sensor_cols) if len(sensor_cols) > 0 else 1
+        row_imp   = imputed_mask.reindex(index=[current_time], columns=sensor_cols, fill_value=False).iloc[0]
         imputed_now = int(row_imp.sum())
-        missingness_number= missingness_number + imputed_now
-        sensors_total = len(sensor_cols)
+        missingness_number += imputed_now
+        sensors_total = len(sensor_cols) if len(sensor_cols) > 0 else 1
         real_now = sensors_total - imputed_now
-        imputed_pct = 100.0 * missingness_number / (sensors_total*arrived_values_number)
-
-        #imputed_now_pct = (missed_values_number / global_values_number) * 100.0
-
+        imputed_pct = 100.0 * missingness_number / (sensors_total * arrived_values_number)
 
         gauge_fig = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=imputed_pct,  # show % of sensors that are IMPUTED at this timestamp
+            mode="gauge+number", value=imputed_pct,
             title={"text": f"Imputed now: {imputed_now} • Real: {real_now}"},
             gauge={
                 "axis": {"range": [0, 100]},
-                "bar": {"color": "red" if imputed_pct >= DEFAULT_VALUES["gauge_red_max"] else "green"},
+                "bar": {"color": "red" if imputed_pct >= DEFAULT_VALUES['gauge_red_max'] else "green"},
                 "steps": [
-                    {"range": [DEFAULT_VALUES["gauge_green_min"], DEFAULT_VALUES["gauge_green_max"]],
-                     "color": "lightgreen"},
-                    {"range": [DEFAULT_VALUES["gauge_yellow_min"], DEFAULT_VALUES["gauge_yellow_max"]],
-                     "color": "yellow"},
-                    {"range": [DEFAULT_VALUES["gauge_red_min"], DEFAULT_VALUES["gauge_red_max"]], "color": "red"},
+                    {"range": [DEFAULT_VALUES['gauge_green_min'], DEFAULT_VALUES['gauge_green_max']], "color": "lightgreen"},
+                    {"range": [DEFAULT_VALUES['gauge_yellow_min'], DEFAULT_VALUES['gauge_yellow_max']], "color": "yellow"},
+                    {"range": [DEFAULT_VALUES['gauge_red_min'],    DEFAULT_VALUES['gauge_red_max']],    "color": "red"},
                 ],
             },
         ))
         gauge_fig.update_layout(margin=dict(l=20, r=20, t=40, b=20), uirevision="gauge")
 
-        # render (keep your existing placeholder; just ensure it has a key)
-
-
-        # keep user zoom/selection across updates
-        sliding_fig.update_layout(uirevision="snapshot")
-        full_ts_fig.update_layout(uirevision="global")
-        gauge_fig.update_layout(uirevision="gauge")
-
-        # clear then re-render — no keys needed
-        # snapshot_ph.empty()
-        # global_ts_ph.empty()
-        # gauge_ph.empty()
-
-        # per-tick unique keys -> no collisions within a single run
-        # snapshot_ph.plotly_chart(sliding_fig, use_container_width=True, key=f"{uid}_snapshot_{iter_key}")
-        # global_ts_ph.plotly_chart(full_ts_fig, use_container_width=True, key=f"{uid}_global_{iter_key}")
-        # gauge_ph.plotly_chart(gauge_fig, use_container_width=True, key=f"{uid}_gauge_{iter_key}")
-        # clés STABLES (ne pas vider les placeholders avant)
-        sliding_fig.update_layout(uirevision="snapshot")
-        full_ts_fig.update_layout(uirevision="global")
-        gauge_fig.update_layout(uirevision="gauge")
-
-        snapshot_ph.plotly_chart(sliding_fig, use_container_width=True, key=f"{uid}_snapshot_{iter_key}")
         global_ts_ph.plotly_chart(full_ts_fig, use_container_width=True, key=f"{uid}_global_{iter_key}")
         gauge_ph.plotly_chart(gauge_fig, use_container_width=True, key=f"{uid}_gauge_{iter_key}")
 
-        # pacing
+        # pacing de la simulation
         time.sleep(1)
+
+
 
 
