@@ -166,7 +166,7 @@ class GCNLSTMImputer(nn.Module):
         return output
 
 class SpatioTemporalDataset(Dataset):
-    def __init__(self, X, y, mask, seq_len=24):
+    def __init__(self, X, y, mask, seq_len=36):
         self.X = torch.FloatTensor(X)
         self.y = torch.FloatTensor(y)
         self.mask = torch.FloatTensor(mask)
@@ -304,283 +304,264 @@ def create_adjacency_matrix(latlng_df, threshold_type='gaussian', sigma_sq_ratio
 
     return torch.tensor(adj_norm, dtype=torch.float32)
 
+# ---- TRAINING TSGUARD -------------------------------------------------
+def train_model(
+    tr: pd.DataFrame,          # ground_df (vérité terrain)
+    df: pd.DataFrame,          # missing_df (avec trous)
+    pf,                        # positions (DataFrame ou dict {id: (lon,lat) / {...}})
+    epochs: int = 20,
+    model_path: str = "gcn_lstm_imputer.pth",
+    seq_len: int = 36,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    sigma_sq_ratio: float = 0.1,
+    device: torch.device = None,
+):
+    # ---------------- Helpers ----------------
+    def _ensure_datetime_index(dfi: pd.DataFrame) -> pd.DataFrame:
+        dfi = dfi.copy()
+        if "datetime" in dfi.columns:
+            dfi["datetime"] = pd.to_datetime(dfi["datetime"], errors="coerce")
+            dfi = dfi.dropna(subset=["datetime"]).set_index("datetime")
+        elif not isinstance(dfi.index, pd.DatetimeIndex):
+            dfi.index = pd.to_datetime(dfi.index, errors="coerce")
+            dfi = dfi[~dfi.index.isna()]
+        dfi.index = dfi.index.floor("h")
+        dfi = dfi[~dfi.index.duplicated(keep="first")]
+        return dfi.sort_index()
 
-def train_model(train_file, missing_file, positions_file, epochs, model_path):
+    def _strip_leading_zeros_cols(dfi: pd.DataFrame) -> pd.DataFrame:
+        dfi = dfi.copy()
+        dfi.columns = [
+            (str(c).lstrip("0") if str(c).isdigit() else str(c))
+            for c in dfi.columns
+        ]
+        return dfi
 
-
-
-
-    # ---- helpers ------------------------------------------------------------
-    def norm_id_colname(c: object) -> str:
-        """Normalize column names: keep 'datetime' as is; for all-digit names, zero-pad to 6."""
-        s = str(c).strip()
-        if s.lower() == "datetime":
-            return "datetime"
-        return s.zfill(6) if s.isdigit() else s
-
-    def norm_df_columns(df: pd.DataFrame) -> pd.DataFrame:
-        return df.rename(columns={c: norm_id_colname(c) for c in df.columns})
-
-    def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
-        if "datetime" in df.columns:
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            df = df.set_index("datetime")
-        return df
-
-    def load_positions_df(obj) -> pd.DataFrame:
-        """
-        Return DataFrame with columns: sensor_id, latitude, longitude.
-        If obj is a dict like {0:(lon,lat), ...}, we convert it.
-        """
-        if isinstance(obj, dict):
-            # dict assumed as {idx: (lon, lat)}
-            df = (pd.DataFrame.from_dict(obj, orient="index", columns=["longitude", "latitude"])
-                    .rename_axis("sensor_id").reset_index())
-        elif isinstance(obj, pd.DataFrame):
-            df = obj.copy()
-        elif hasattr(obj, "read"):  # Streamlit UploadedFile
-            raw = obj.read()
-            # try CSV first
-            try:
-                df = pd.read_csv(io.BytesIO(raw))
-            except Exception:
-                data = json.loads(raw.decode("utf-8"))
-                if isinstance(data, dict):
-                    df = (pd.DataFrame.from_dict(data, orient="index",
-                                                 columns=["longitude", "latitude"])
-                            .rename_axis("sensor_id").reset_index())
+    def _coerce_positions(pf_in) -> pd.DataFrame:
+        import io, json as _json
+        if isinstance(pf_in, pd.DataFrame):
+            dfp = pf_in.copy()
+            dfp = dfp.rename(columns={"lat": "latitude", "lng": "longitude", "lon": "longitude"})
+            if "sensor_id" not in dfp.columns:
+                dfp = dfp.reset_index().rename(columns={"index": "sensor_id"})
+            need = {"sensor_id", "latitude", "longitude"}
+            miss = need - set(dfp.columns)
+            if miss:
+                raise ValueError(f"Positions: colonnes manquantes {miss}. Colonnes reçues: {list(dfp.columns)}")
+            dfp = dfp[list(need)]
+        elif isinstance(pf_in, dict):
+            rows = []
+            for k, v in pf_in.items():
+                sid = str(k)
+                if isinstance(v, (list, tuple)) and len(v) == 2:
+                    lon, lat = float(v[0]), float(v[1])
+                elif isinstance(v, dict):
+                    lat = v.get("latitude", v.get("lat"))
+                    lon = v.get("longitude", v.get("lon", v.get("lng")))
+                    if lat is None or lon is None:
+                        raise ValueError(f"Dict position invalide pour {k}: {v}")
+                    lat, lon = float(lat), float(lon)
                 else:
-                    df = pd.DataFrame(data)
-        elif isinstance(obj, str):
-            # path
+                    raise ValueError(f"Type de valeur inconnu pour {k}: {type(v)}")
+                rows.append({"sensor_id": sid, "latitude": lat, "longitude": lon})
+            dfp = pd.DataFrame(rows, columns=["sensor_id", "latitude", "longitude"])
+        elif hasattr(pf_in, "read"):
+            raw = pf_in.read()
             try:
-                df = pd.read_csv(obj)
+                dfp = pd.read_csv(io.BytesIO(raw))
+                return _coerce_positions(dfp)
             except Exception:
-                with open(obj, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    df = (pd.DataFrame.from_dict(data, orient="index",
-                                                 columns=["longitude", "latitude"])
-                            .rename_axis("sensor_id").reset_index())
+                data = _json.loads(raw.decode("utf-8"))
+                return _coerce_positions(data)
+        else:
+            from pathlib import Path as _Path
+            if isinstance(pf_in, (str, _Path)):
+                p = _Path(pf_in)
+                if p.suffix.lower() in {".csv", ".txt"}:
+                    dfp = pd.read_csv(p)
+                    return _coerce_positions(dfp)
                 else:
-                    df = pd.DataFrame(data)
+                    with open(p, "r", encoding="utf-8") as f:
+                        data = _json.load(f)
+                    return _coerce_positions(data)
+            raise TypeError(f"type positions non supporté: {type(pf_in)}")
+
+        dfp["sensor_id"] = dfp["sensor_id"].astype(str).str.strip()
+        dfp["latitude"] = pd.to_numeric(dfp["latitude"], errors="coerce")
+        dfp["longitude"] = pd.to_numeric(dfp["longitude"], errors="coerce")
+        dfp = dfp.dropna(subset=["latitude", "longitude"]).reset_index(drop=True)
+        return dfp
+
+    def _strip_zeros_safe(s: str) -> str:
+        if s.isdigit():
+            out = s.lstrip("0")
+            return out if out != "" else "0"
+        return s
+
+    # ------------- Préparation DF -------------
+    ground_df  = tr.copy()
+    missing_df = df.copy()
+
+    ground_df  = _ensure_datetime_index(ground_df)
+    missing_df = _ensure_datetime_index(missing_df)
+
+    ground_df  = _strip_leading_zeros_cols(ground_df)
+    missing_df = _strip_leading_zeros_cols(missing_df)
+
+    ground_df.columns  = [str(c).strip() for c in ground_df.columns]
+    missing_df.columns = [str(c).strip() for c in missing_df.columns]
+
+    latlng = _coerce_positions(pf).copy()
+    latlng["sensor_id"] = latlng["sensor_id"].astype(str).str.strip()
+
+    sid = latlng["sensor_id"]
+    if sid.str.fullmatch(r"\d+").all():
+        ids = sid.astype(int)
+        if ids.min() == 0 and ids.max() == len(latlng) - 1 and len(set(ids)) == len(latlng):
+            latlng = latlng.sort_values("sensor_id", key=lambda s: s.astype(int)).reset_index(drop=True)
+            latlng["sensor_id"] = list(ground_df.columns)[:len(latlng)]
         else:
-            raise TypeError("positions_file must be dict, DataFrame, path, or file-like.")
+            latlng["sensor_id"] = latlng["sensor_id"].map(_strip_zeros_safe)
 
-        # normalize column names and aliases
-        df.columns = [c.strip().lower() for c in df.columns]
-        df = df.rename(columns={"lon": "longitude", "lng": "longitude", "lat": "latitude"})
-        if "sensor_id" not in df.columns:
-            df = df.reset_index().rename(columns={"index": "sensor_id"})
+    sensor_cols = latlng["sensor_id"].astype(str).tolist()
 
-        required = {"sensor_id", "latitude", "longitude"}
-        if not required.issubset(df.columns):
-            raise ValueError(f"Positions file must contain {required}. Found: {list(df.columns)}")
-
-        # Don't force zero-padding yet; we may need to remap 0..N-1 to real IDs later.
-        df["sensor_id"] = df["sensor_id"].astype(str).str.strip()
-        return df[["sensor_id", "latitude", "longitude"]]
-
-    def remap_positions_ids_if_indexed(latlng: pd.DataFrame, ground_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        If positions have sensor_id like '0','1',...,'N-1', remap them to the actual sensor
-        column names from ground_df (e.g., '001001'...'001036') preserving order.
-        """
-        # columns present in ground_df (already normalized later)
-        gcols = [c for c in ground_df.columns]
-        # positions ids that look like integers 0..N-1
-        print(latlng.head())
-        print(latlng.dtypes)
-        if latlng["sensor_id"].str.fullmatch(r"\d+").all():
-            ids = latlng["sensor_id"].astype(int)
-            if ids.min() == 0 and ids.max() == len(latlng) - 1:
-                # sort by the numeric id to ensure consistent order
-                latlng = latlng.sort_values("sensor_id", key=lambda s: s.astype(int)).reset_index(drop=True)
-                # map to ground_df columns by order
-                if len(gcols) < len(latlng):
-                    raise ValueError(
-                        f"Positions rows ({len(latlng)}) exceed available sensor columns in ground_df ({len(gcols)})."
-                    )
-                latlng["sensor_id"] = gcols[:len(latlng)]
-        else:
-            # if already like '001001', leave as-is but normalize to 6-digit digit-only when appropriate
-            latlng["sensor_id"] = latlng["sensor_id"].apply(
-                lambda s: s if not s.isdigit() else s.zfill(6)
-            )
-        return latlng
-
-    # ---- graph size & edges -------------------------------------------------
-    graph_size = st.session_state.get('graph_size', DEFAULT_VALUES["graph_size"])
-    sensor_positions = {i: (i % 5, i // 5) for i in range(graph_size)}
-    edge_index = helper.build_edge_index(sensor_positions)
-
-    # ---- load / normalize inputs -------------------------------------------
-    # Expect train_file & missing_file already as DataFrames (from your Streamlit pipeline)
-    ground_df = train_file.copy()
-    missing_df = missing_file.copy()
-
-    # Normalize column names: keep datetime, zero-pad purely digit names
-    #ground_df = norm_df_columns(ground_df)
-    #missing_df = norm_df_columns(missing_df)
-
-    # Ensure datetime index for both
-    ground_df = ensure_datetime_index(ground_df)
-    missing_df = ensure_datetime_index(missing_df)
-
-    # If still not datetime, try to coerce index directly
-    if not isinstance(ground_df.index, pd.DatetimeIndex):
-        ground_df.index = pd.to_datetime(ground_df.index, errors="coerce")
-    if not isinstance(missing_df.index, pd.DatetimeIndex):
-        missing_df.index = pd.to_datetime(missing_df.index, errors="coerce")
-
-    # Drop rows where datetime could not be parsed
-    ground_df = ground_df[~ground_df.index.isna()]
-    missing_df = missing_df[~missing_df.index.isna()]
-
-    # Load and normalize positions
-    latlng = load_positions_df(positions_file)  # columns: sensor_id, latitude, longitude
-    # If positions are 0..N-1, remap to actual sensor names from ground_df
-    latlng = remap_positions_ids_if_indexed(latlng, ground_df)
-
-    # Final normalization: ensure positions IDs match ground/missing style (zero-padded if digits)
-    latlng["sensor_id"] = latlng["sensor_id"].apply(lambda s: s if not s.isdigit() else s.zfill(6))
-
-    # ---- align columns ------------------------------------------------------
-    sensor_cols = latlng["sensor_id"].tolist()  # e.g., ['001001', '001002', ...]
-    # Sanity checks
-    missing_in_ground = sorted(set(sensor_cols) - set(map(str, ground_df.columns)))
-    missing_in_missing = sorted(set(sensor_cols) - set(map(str, missing_df.columns)))
+    missing_in_ground  = sorted(set(sensor_cols) - set(ground_df.columns))
+    missing_in_missing = sorted(set(sensor_cols) - set(missing_df.columns))
     if missing_in_ground or missing_in_missing:
         raise KeyError(
-            "Some expected sensor columns are missing.\n"
-            f"- Missing in ground_df: {missing_in_ground}\n"
-            f"- Missing in missing_df: {missing_in_missing}\n"
-            f"- Sample ground_df columns: {list(ground_df.columns)[:8]}"
+            "Colonnes capteurs manquantes après normalisation.\n"
+            f"- Manquantes dans ground: {missing_in_ground}\n"
+            f"- Manquantes dans missing: {missing_in_missing}\n"
+            f"- Exemples colonnes ground: {list(ground_df.columns)[:8]}"
         )
 
-    # Reindex columns to the exact order from positions
-    ground_df = ground_df[sensor_cols]
+    ground_df  = ground_df[sensor_cols]
     missing_df = missing_df[sensor_cols]
-    # remove duplicate timestamps if any
-    ground_df = ground_df[~ground_df.index.duplicated(keep="first")]
-    missing_df = missing_df[~missing_df.index.duplicated(keep="first")]
 
-    # keep only the timestamps present in BOTH
-    common_index = ground_df.index.intersection(missing_df.index)
+    common_idx = ground_df.index.intersection(missing_df.index)
+    if common_idx.empty:
+        raise ValueError("Aucun chevauchement temporel entre ground et missing.")
+    ground_df  = ground_df.loc[common_idx].sort_index()
+    missing_df = missing_df.loc[common_idx].sort_index()
 
-    if len(common_index) == 0:
-        raise ValueError(
-            "No overlapping timestamps between ground and missing data. "
-            f"ground_df span: {ground_df.index.min()} -> {ground_df.index.max()}, "
-            f"missing_df span: {missing_df.index.min()} -> {missing_df.index.max()}"
-        )
-
-    # align & sort
-
-    ground_df = ground_df.loc[common_index].sort_index()
-    missing_df = missing_df.loc[common_index].sort_index()
-
-    # safety checks
-    train_month_list = [1, 2, 4, 5, 7, 8, 10, 11]
-    SEQ_LEN = 24
-    if len(common_index) < 2 * SEQ_LEN:
-        raise ValueError(f"Not enough overlapping timestamps after alignment: {len(common_index)} rows.")
-    if not np.any(np.isin(missing_df.index.month, train_month_list)):
-        raise ValueError("Train split is empty. Check your train_month_list or the data's date range.")
-
-    # ---- numpy conversion & simple imputation -------------------------------
-    ground_data = ground_df.to_numpy(dtype=np.float32)
+    # ------------- Numpy & X imputé -------------
+    ground_data  = ground_df.to_numpy(dtype=np.float32)
     missing_data = missing_df.to_numpy(dtype=np.float32)
 
-    # simple ffill/bfill for model inputs; evaluation still compares to ground_data
-    imputed_df = missing_df.fillna(method='ffill').fillna(method='bfill')
+    imputed_df   = missing_df.ffill().bfill()
     imputed_data = imputed_df.to_numpy(dtype=np.float32)
 
-    # ---- adjacency & model --------------------------------------------------
-    adj_matrix = create_adjacency_matrix(latlng, sigma_sq_ratio=0.1)
+    loss_mask = np.where(np.isnan(missing_data) & np.isfinite(ground_data), 1.0, 0.0).astype(np.float32)
 
-    NUM_NODES = missing_data.shape[1]
-    GCN_HIDDEN = 64
-    LSTM_HIDDEN = 64
+    # ------------- Splits & Scaler -------------
+    months = missing_df.index.month
+    train_month_list = [1, 2, 4, 5, 7, 8, 10, 11]
+    valid_month_list = [2, 5, 8, 11]
 
+    train_slice = np.isin(months, train_month_list)
+    valid_slice = np.isin(months, valid_month_list)
+
+    if len(common_idx) < 2 * seq_len:
+        raise ValueError(f"Pas assez d'instants après alignement: {len(common_idx)} (< {2*seq_len}).")
+    if not np.any(train_slice):
+        raise ValueError("Train split vide (vérifie les mois présents dans tes données).")
+
+    train_imputed = imputed_data[train_slice]
+    min_val = float(np.nanmin(train_imputed))
+    max_val = float(np.nanmax(train_imputed))
+    denom   = (max_val - min_val) if (max_val - min_val) != 0 else 1.0
+
+    scaler     = lambda x: (x - min_val) / denom
+    inv_scaler = lambda x: x * denom + min_val
+
+    from pathlib import Path as _P
+    scaler_params = {"min_val": min_val, "max_val": max_val}
+    scaler_json   = str(_P(model_path).with_suffix('')) + "_scaler.json"
+    with open(scaler_json, "w") as f:
+        json.dump(scaler_params, f, indent=2)
+
+    X_norm = scaler(imputed_data)
+    Y_norm = scaler(ground_data)
+    Y_norm = np.nan_to_num(Y_norm, nan=0.0)
+
+    X_train, y_train, m_train = X_norm[train_slice], Y_norm[train_slice], loss_mask[train_slice]
+    X_val,   y_val,   m_val   = X_norm[valid_slice], Y_norm[valid_slice], loss_mask[valid_slice]
+
+    # ------------- Datasets/Loaders -------------
+    train_ds = SpatioTemporalDataset(X_train, y_train, m_train, seq_len=seq_len)
+    val_ds   = SpatioTemporalDataset(X_val,   y_val,   m_val,   seq_len=seq_len)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  drop_last=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False)
+
+    # ------------- Modèle & Adj -------------
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    adj = create_adjacency_matrix(latlng, threshold_type='gaussian', sigma_sq_ratio=sigma_sq_ratio).to(device)
+
+    num_nodes = imputed_data.shape[1]
     model = GCNLSTMImputer(
-        adj=adj_matrix.to(device),
-        num_nodes=NUM_NODES,
-        in_features=NUM_NODES,
-        gcn_hidden=GCN_HIDDEN,
-        lstm_hidden=LSTM_HIDDEN,
-        out_features=NUM_NODES
+        adj=adj,
+        num_nodes=num_nodes,
+        in_features=num_nodes,
+        gcn_hidden=64,
+        lstm_hidden=64,
+        out_features=num_nodes,
     ).to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=0.1)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    # ---- split, scaling -----------------------------------------------------
+    # ------------- Entraînement -------------
+    try:
+        pbar = st.progress(0.0)
+        status = st.container()
+        use_streamlit = True
+    except Exception:
+        use_streamlit = False
 
-    months = missing_df.index.month
-
-    # mask where we have ground truth for NaNs in missing_data
-    loss_mask = np.where(np.isnan(missing_data) & ~np.isnan(ground_data), 1.0, 0.0).astype(np.float32)
-    train_slice = np.isin(months, train_month_list)
-
-    train_imputed_data = imputed_data[train_slice]
-    min_val = np.nanmin(train_imputed_data)
-    max_val = np.nanmax(train_imputed_data)
-    denom = (max_val - min_val) if (max_val - min_val) != 0 else 1.0
-    scaler = lambda x: (x - min_val) / denom
-    inv_scaler = lambda x: x * denom + min_val
-    scaler_params = {'min_val': float(min_val), 'max_val': float(max_val)}
-
-    imputed_data_normalized = scaler(imputed_data)
-    ground_data_normalized = scaler(ground_data)
-    ground_data_normalized = np.nan_to_num(ground_data_normalized, nan=0.0)
-
-    X_train = imputed_data_normalized[train_slice]
-    y_train = ground_data_normalized[train_slice]
-    mask_train = loss_mask[train_slice]
-
-
-    BATCH_SIZE = 32
-    train_dataset = SpatioTemporalDataset(X_train, y_train, mask_train, seq_len=SEQ_LEN)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-
-    # ---- training loop ------------------------------------------------------
-    progress_bar = st.progress(0.0)
-    status_container = st.container()
-
-    avg_train_loss = 0.0
     model.train()
     for epoch in range(epochs):
-        total_train_loss = 0.0
-        num_batches = 0
-
-        for inputs, targets, mask in train_loader:
-            inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
+        tot, n = 0.0, 0
+        for xb, yb, mb in train_loader:
+            xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = masked_loss(outputs, targets, mask)
-            if not torch.isnan(loss) and torch.sum(mask) > 0:
+            out = model(xb)
+            loss = masked_loss(out, yb, mb)
+            if torch.isfinite(loss) and torch.sum(mb) > 0:
                 loss.backward()
                 optimizer.step()
-                total_train_loss += loss.item()
-                num_batches += 1
+                tot += loss.item()
+                n += 1
 
-        epoch_loss = (total_train_loss / max(num_batches, 1))
-        avg_train_loss += epoch_loss
+        # validation (FIX ICI: pas d'argument nommé 'out')
+        model.eval()
+        with torch.no_grad():
+            vtot, vn = 0.0, 0
+            for xb, yb, mb in val_loader:
+                xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
+                out = model(xb)
+                vloss = masked_loss(out, yb, mb)  # <-- arguments positionnels
+                if torch.isfinite(vloss) and torch.sum(mb) > 0:
+                    vtot += vloss.item(); vn += 1
+        model.train()
 
-        progress_bar.progress(int((epoch + 1) * 100 / max(epochs, 1)))
-        with status_container:
-            st.write(f"🔹 **Epoch {epoch + 1}** | 📉 **Loss:** `{epoch_loss:.4f}`")
+        train_loss = tot / max(n, 1)
+        val_loss   = vtot / max(vn, 1)
 
-    avg_train_loss /= max(epochs, 1)
+        if use_streamlit:
+            pbar.progress(int((epoch + 1) * 100 / max(epochs, 1)))
+            with status:
+                st.write(f"🔹 **Epoch {epoch+1}** | 📉 **Train:** `{train_loss:.4f}` | 🧪 **Val:** `{val_loss:.4f}`")
+        else:
+            print(f"Epoch {epoch+1}/{epochs} — train {train_loss:.4f} | val {val_loss:.4f}")
 
-    # ---- save model ---------------------------------------------------------
-    MODEL_SAVE_PATH = model_path if model_path else "gcn_lstm_imputer.pth"
-    torch.save(model.state_dict(), MODEL_SAVE_PATH)
-    print(f"Epoch {epoch + 1}/{epochs} | Train Loss: {avg_train_loss:.6f}")
-    scaler_path = os.path.splitext(MODEL_SAVE_PATH)[0] + "_scaler.json"
-    with open(scaler_path, "w") as f:
-        json.dump(scaler_params, f)
-    print(f"Scaler params saved to {scaler_path}")
+    # ------------- Sauvegarde & retour -------------
+    torch.save(model.state_dict(), model_path)
+    if use_streamlit:
+        st.success(f"✅ Modèle sauvegardé: `{model_path}` ; Scaler: `{scaler_json}`")
+    else:
+        print(f"Saved model to {model_path} and scaler to {scaler_json}")
 
     return model
 
@@ -1242,6 +1223,50 @@ def _avg_mse_per_timestamp_pair(
             out2[t] = float(np.mean(d2 * d2))
     return pd.Series(out1, index=idx_time), pd.Series(out2, index=idx_time)
 
+def render_pristi_window_only(
+    ph,
+    time_index: pd.DatetimeIndex,
+    pristi_cols: list[str],
+    pristi_block: pd.DataFrame,   # (36, N) valeurs PriSTI (échelle originale)
+    win_mask_df: pd.DataFrame,    # (36, N) bool -> True si cellule était manquante à l’origine
+    title_suffix: str = "",
+):
+    # palette fixe
+    palette = ["#000000", "#003366", "#009999", "#006600", "#66CC66",
+               "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"]
+    sensor_color_map = {c: palette[i % len(palette)] for i, c in enumerate(pristi_cols)}
+
+    # aligne les grilles
+    pristi_block = pristi_block.reindex(index=time_index, columns=pristi_cols)
+    win_mask_df  = win_mask_df.reindex(index=time_index, columns=pristi_cols).fillna(False)
+
+    fig = go.Figure()
+    # segments style TSGuard : rouge si un des bouts est imputé
+    _window_lines(
+        fig=fig,
+        block=pristi_block,
+        mask_df=win_mask_df,
+        sensor_cols=pristi_cols,
+        sensor_color_map=sensor_color_map,
+        gap_hours=6,
+        only_last_imputed=False,  # on garde tout, ça « glisse » à gauche naturellement
+    )
+
+    title = "PriSTI — Last 36 timestamps"
+    if title_suffix:
+        title += f" {title_suffix}"
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time",
+        yaxis_title="Sensor value",
+        margin=dict(l=10, r=10, t=48, b=10),
+        uirevision="pristi_only",  # conserve zoom/viewport
+    )
+
+    # clé stable pour que Streamlit mette juste à jour le graphe
+    ts_key = int(pd.Timestamp(time_index[-1]).value)
+    ph.plotly_chart(fig, use_container_width=True, key=f"pri_only_{ts_key}")
 
 def _window_lines(fig: go.Figure,
                   block: pd.DataFrame,          # (T,N) values for 36-step window
@@ -1651,30 +1676,30 @@ def run_simulation_with_live_imputation(
             st.session_state.deck_obj.initial_view_state = fit_view_simple(st.session_state._fit_base_df)
             graph_placeholder.pydeck_chart(st.session_state.deck_obj, use_container_width=True)
 
-    # --- layout for charts: two side-by-side under the map, then gauge ---
-    # layout once
     if not st.session_state.get("_charts_layout_inited", False):
         st.markdown("---")
-        col_ts, col_snap = st.columns([2, 2])
-        with col_ts:
+        # Ligne 1 : Gauge (gauche) + Global TS (droite)
+        col_left, col_right = st.columns([1, 3])
+        with col_left:
+            st.subheader("Missed Data (%)")
+            st.session_state["_gauge_ph"] = st.empty()
+        with col_right:
             st.subheader("Global Time Series")
             st.session_state["_global_ts_ph"] = st.empty()
-        with col_snap:
-            st.subheader("10-Step Snapshot")
-            st.session_state["_snapshot_ph"] = st.empty()
 
         st.markdown("---")
-        st.subheader("PriSTI vs TSGuard (last 36)")
+        # Ligne 2 : Snapshot 36 (plein écran)
+        st.subheader("TSGuard — fenêtre glissante (36)")
+        st.session_state["_snapshot36_ph"] = st.empty()
+
+        # Ligne 3 : PriSTI (plein écran)
+        st.subheader("PriSTI — fenêtre glissante (36)")
         st.session_state["_pristi_cmp_ph"] = st.empty()
-
-        st.markdown("---")
-        st.subheader("Missed Data (%)")
-        st.session_state["_gauge_ph"] = st.empty()
 
         st.session_state["_charts_layout_inited"] = True
 
     global_ts_ph = st.session_state["_global_ts_ph"]
-    snapshot_ph = st.session_state["_snapshot_ph"]
+    snapshot_ph = st.session_state["_snapshot36_ph"]
     gauge_ph = st.session_state["_gauge_ph"]
     pristi_cmp_ph = st.session_state["_pristi_cmp_ph"]
 
@@ -1686,7 +1711,7 @@ def run_simulation_with_live_imputation(
 
     uid = st.session_state.sim_uid
 
-    SNAPSHOT_STEPS = 10  # window length for the snapshot chart
+    SNAPSHOT_STEPS = 36  # window length for the snapshot chart
 
     #global_df = pd.DataFrame(columns=["datetime"] + list(sensor_cols))
     palette = ["#000000", "#003366", "#009999", "#006600", "#66CC66",
@@ -1800,24 +1825,22 @@ def run_simulation_with_live_imputation(
         if len(sliding_window_df) > SNAPSHOT_STEPS:
             sliding_window_df = sliding_window_df.tail(SNAPSHOT_STEPS)
 
-
-        # --- PriSTI (toutes les 36 observations, sans réimputer l'ancien) ---
+        # --- PriSTI : imputer à chaque pas dès qu'on a 36 timestamps ---
         if pristi_enabled:
             try:
                 pristi_running_df = st.session_state["pristi_running_df"]
                 end_loc = pristi_running_df.index.get_loc(current_time)
                 EVAL_LENGTH = 36
 
-                # lancer seulement aux frontières 36k
-                if not isinstance(end_loc, slice) and (end_loc + 1) % EVAL_LENGTH == 0:
-                    # inside run_simulation_with_live_imputation(...) in the PriSTI block
-                    # (we are already inside: if pristi_enabled and (end_loc+1) % EVAL_LENGTH == 0)
+                if not isinstance(end_loc, slice) and (end_loc + 1) >= EVAL_LENGTH:
+                    # fenêtre glissante [t-35 ... t]
+                    start_loc = end_loc - (EVAL_LENGTH - 1)
+                    time_index = pristi_running_df.index[start_loc:end_loc + 1]
 
-                    time_index = pristi_running_df.index[end_loc - (EVAL_LENGTH - 1): end_loc + 1]
-                    ours_block = missing_df.loc[time_index, pristi_cols].copy()
+                    # imputation PriSTI uniquement sur cette fenêtre
                     updated_df, info = impute_window_with_pristi(
-                        missing_df=pristi_running_df[pristi_cols].copy(),
-                        sensor_cols=pristi_cols,
+                        missing_df=pristi_running_df.copy(),  # on lui passe le DF courant
+                        sensor_cols=pristi_cols,  # 36 premiers capteurs
                         target_timestamp=current_time,
                         model=st.session_state["pristi_model"],
                         device=device,
@@ -1825,31 +1848,27 @@ def run_simulation_with_live_imputation(
                         nsample=100,
                     )
                     if info == "ok":
+                        # on remplace juste la tranche glissante (sans réécrire l'historique antérieur)
                         pristi_running_df.loc[time_index, pristi_cols] = updated_df.loc[time_index, pristi_cols].values
                         st.session_state["pristi_running_df"] = pristi_running_df
 
-                        win_mask_df = st.session_state.orig_missing_baseline.reindex(
-                            index=time_index, columns=pristi_cols
-                        ).fillna(False)
+                    # masque « manquant à l'origine » restreint à la fenêtre
+                    win_mask_df = st.session_state.orig_missing_baseline.reindex(
+                        index=time_index, columns=pristi_cols
+                    ).fillna(False)
 
-                        pristi_block = pristi_running_df.loc[time_index, pristi_cols].copy()
+                    # bloc PriSTI de la fenêtre courante
+                    pristi_block = pristi_running_df.loc[time_index, pristi_cols].copy()
 
-                        ground_block = None
-                        gref = st.session_state.get("ground_ref")
-                        if isinstance(gref, pd.DataFrame):
-                            ground_block = gref.reindex(index=time_index).reindex(columns=pristi_cols)
-
-                        render_pristi_window_plus_mse(
-                            ph=pristi_cmp_ph,
-                            time_index=time_index,
-                            pristi_cols=pristi_cols,
-                            ours_block=ours_block,  # used only to compute TSGuard MSE
-                            pristi_block=pristi_block,
-                            win_mask_df=win_mask_df,
-                            ground_block=ground_block,
-                            title_suffix=f"(end {time_index[-1]})",
-                        )
-
+                    # AFFICHAGE : PriSTI plein écran, pas de graphe MSE
+                    render_pristi_window_only(
+                        ph=pristi_cmp_ph,
+                        time_index=time_index,
+                        pristi_cols=pristi_cols,
+                        pristi_block=pristi_block,
+                        win_mask_df=win_mask_df,
+                        title_suffix=f"(fin {time_index[-1]})",
+                    )
 
             except Exception as e:
                 st.caption(f"PriSTI error @ {current_time}: {e}")
@@ -1903,7 +1922,7 @@ def run_simulation_with_live_imputation(
             showlegend=True, name="Imputed segment"
         ))
         sliding_fig.update_layout(
-            title="10-Step Snapshot",
+            title="36-Step Snapshot",
             xaxis_title="Time",
             yaxis_title="Sensor Value",
             margin=dict(l=20, r=20, t=40, b=20),
