@@ -5,7 +5,7 @@ from utils.config import DEFAULT_VALUES
 # Setting Management
 # ----------------------------
 def add_setting_panel():
-    with st.expander("⚙️ Settings", expanded=False):
+    with st.expander("⚙️ Settings", expanded=True):
         tab1, tab2, tab3, tab4 = st.tabs(["📌 Constraints", "📈 Threshold", "📊 Missing values", "🕸️ Graph Options"])
         
         with tab1:

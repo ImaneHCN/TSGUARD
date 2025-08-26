@@ -1,9 +1,14 @@
 [theme]
 base="light"
-primaryColor="#ff4b8b"        # rose fuchsia
-backgroundColor="#fff5f8"     # fond légèrement rosé
-secondaryBackgroundColor="#ffe3ec"  # panneaux rosés
-textColor="#262730"
+
+# Palette "bleu-gris pro"
+primaryColor="#1B63A1"            # boutons & accents
+backgroundColor="#EAF2FF"         # fond global (bleu très clair)
+secondaryBackgroundColor="#F7FAFF" # panneaux/cartes (plus blanc)
+textColor="#0B1F33"               # texte foncé lisible
+
+font="Inter"                      # optionnel (ou "sans serif")
+
 [server]
 fileWatcherType = "none"
 
