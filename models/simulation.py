@@ -216,69 +216,6 @@ def masked_loss(outputs, targets, mask):
     # We only want the average over the non-zero elements of the mask
     return torch.sum(masked_loss) / torch.sum(mask)
 
-def plot_sliding_custom_chart(sliding_df, sstates, sensor_cols):
-    fig = go.Figure()
-
-    STATION_COLORS = [
-        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
-        "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
-        "#bcbd22", "#17becf"
-    ]
-
-    for i, col in enumerate(sensor_cols):
-        color_real = STATION_COLORS[i % len(STATION_COLORS)]
-        timestamps = sliding_df["datetime"].tolist()
-        values = sliding_df[col].tolist()
-        states = sstates[col]  # Assume sstates is a dict of col -> list of booleans
-
-        segment_x = []
-        segment_y = []
-        segment_color = color_real
-
-        def add_segment():
-            if len(segment_x) >= 2:
-                fig.add_trace(go.Scatter(
-                    x=segment_x,
-                    y=segment_y,
-                    mode='lines+markers',
-                    line=dict(color=segment_color, width=2),
-                    showlegend=False
-                ))
-
-        for j in range(len(values)):
-            is_real = states[j]
-            val = values[j]
-            if pd.isna(val):
-                continue  # skip NaNs
-
-            if len(segment_x) == 0:
-                # start new segment
-                segment_color = color_real if is_real else "red"
-                segment_x.append(timestamps[j])
-                segment_y.append(val)
-            else:
-                same_state = (segment_color == (color_real if is_real else "red"))
-                if same_state:
-                    segment_x.append(timestamps[j])
-                    segment_y.append(val)
-                else:
-                    # switch segment
-                    add_segment()
-                    segment_x = [timestamps[j - 1], timestamps[j]]
-                    segment_y = [values[j - 1], val]
-                    segment_color = color_real if is_real else "red"
-
-        # Add last segment
-        add_segment()
-
-    fig.update_layout(
-        title="10-Step Sliding Window",
-        xaxis_title="Time",
-        yaxis_title="Sensor Value",
-        margin=dict(l=20, r=20, t=40, b=20)
-    )
-
-    return fig
 
 device = (
     torch.device("cuda")
@@ -792,7 +729,7 @@ def draw_full_time_series(global_df, sim_file, sensor_cols, sensor_color_map):
         showlegend=True,
         name="Imputed Segment"
     ))
-    #title = "Global Time Series",
+    title = "Global Sensors Time Series",
     fig.update_layout(
 
         xaxis_title="Time",
@@ -802,56 +739,6 @@ def draw_full_time_series(global_df, sim_file, sensor_cols, sensor_color_map):
     )
     return fig
 
-def draw_full_time_series_with_mask(global_df, imputed_mask, sensor_cols, sensor_color_map):
-    import plotly.graph_objects as go
-    import pandas as pd
-
-    fig = go.Figure()
-    # segments colorés selon imputation
-    for col in sensor_cols:
-        base_color = sensor_color_map[col]
-        x_vals = global_df["datetime"].tolist()
-        y_vals = global_df[col].tolist()
-
-        seg_x, seg_y, seg_imp = [], [], []
-        for x, y in zip(x_vals, y_vals):
-            if pd.isna(y):
-                continue
-            imputed = bool(imputed_mask.loc[x, col]) if (x in imputed_mask.index) else False
-            seg_x.append(x); seg_y.append(y); seg_imp.append(imputed)
-            if len(seg_x) >= 2:
-                seg_color = "red" if any(seg_imp) else base_color
-                fig.add_trace(go.Scatter(
-                    x=seg_x, y=seg_y, mode="lines+markers",
-                    line=dict(color=seg_color), marker=dict(size=6, color=seg_color),
-                    showlegend=False
-                ))
-                seg_x, seg_y, seg_imp = [seg_x[-1]], [seg_y[-1]], [seg_imp[-1]]
-        if len(seg_x) >= 2:
-            seg_color = "red" if any(seg_imp) else base_color
-            fig.add_trace(go.Scatter(
-                x=seg_x, y=seg_y, mode="lines+markers",
-                line=dict(color=seg_color), marker=dict(size=6, color=seg_color),
-                showlegend=False
-            ))
-
-    # légendes
-    for col in sensor_cols:
-        fig.add_trace(go.Scatter(
-            x=[None], y=[None], mode='markers',
-            marker=dict(size=8, color=sensor_color_map[col]),
-            legendgroup=col, showlegend=True, name=f"Sensor {col}"
-        ))
-    fig.add_trace(go.Scatter(
-        x=[None], y=[None], mode='markers',
-        marker=dict(size=8, color="red"),
-        legendgroup="imputed", showlegend=True, name="Imputed Segment"
-    ))
-    fig.update_layout(
-        xaxis_title="Time", yaxis_title="Sensor Value",
-        margin=dict(l=20, r=20, t=40, b=20), legend_title="Sensors"
-    )
-    return fig
 def draw_full_time_series_with_mask_gap(global_df, imputed_mask, sensor_cols, sensor_color_map, gap_hours=12):
     fig = go.Figure()
     for col in sensor_cols:
@@ -915,38 +802,6 @@ def add_imputed_segments(fig, df_xy, mask_col_bool, base_color, gap_hours=6):
             ))
         prev_x, prev_y, prev_imp = x, y, imp
 
-def draw_gauge_figure(sim_file, current_time, sensor_cols):
-    green_min, green_max = DEFAULT_VALUES["gauge_green_min"], DEFAULT_VALUES["gauge_green_max"]
-    yellow_min, yellow_max = DEFAULT_VALUES["gauge_yellow_min"], DEFAULT_VALUES["gauge_yellow_max"]
-    red_min, red_max = DEFAULT_VALUES["gauge_red_min"], DEFAULT_VALUES["gauge_red_max"]
-
-    if st.session_state.get('missing_value_thresholds'):
-        thresholds = st.session_state['missing_value_thresholds']
-        green_min, green_max = thresholds.get("Green", (green_min, green_max))
-        yellow_min, yellow_max = thresholds.get("Yellow", (yellow_min, yellow_max))
-        red_min, red_max = thresholds.get("Red", (red_min, red_max))
-
-    sim_file_up_to_now = sim_file[sim_file.index <= current_time]
-    total = sim_file_up_to_now[sensor_cols].size
-    missed = sim_file_up_to_now[sensor_cols].isna().sum().sum()
-    pmiss = (missed / total) * 100 if total > 0 else 0
-
-    gauge_fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=pmiss,
-        title={"text": "Overall Missed Data (%)"},
-        gauge={
-            "axis": {"range": [0, 100]},
-            "bar": {"color": "red" if pmiss > red_max else "green"},
-            "steps": [
-                {"range": [green_min, green_max], "color": "lightgreen"},
-                {"range": [yellow_min, yellow_max], "color": "yellow"},
-                {"range": [red_min, red_max], "color": "red"}
-            ]
-        }
-    ))
-    gauge_fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
-    return gauge_fig
 
 def predict_single_missing_value(
     historical_window: np.ndarray,
@@ -1119,135 +974,7 @@ def _cmp_timeseries_fig(
     )
     return fig
 
-def render_pristi_vs_tsg_with_gt(
-    ph,
-    time_index,             # pd.DatetimeIndex de longueur 36
-    pristi_cols,            # liste des 36 capteurs
-    ours_block,             # DataFrame (36,36) TSGuard (échelle originale)
-    pristi_block,           # DataFrame (36,36) PriSTI  (échelle originale)
-    win_mask_df,            # DataFrame bool (36,36) -> True si manquant à l'origine
-    ground_block=None,      # DataFrame (36,36) réel, optionnel
-    title_suffix=""
-):
-    import numpy as np, pandas as pd, plotly.graph_objects as go
 
-    have_gt = isinstance(ground_block, pd.DataFrame) and not ground_block.empty
-
-    # petits décalages pour séparer visuellement les 3 points au même instant
-    OFF_TSG = pd.Timedelta(seconds=-60)
-    OFF_PRI = pd.Timedelta(seconds=+60)
-    OFF_GT  = pd.Timedelta(seconds=0)
-
-    x_gt,  y_gt,  hov_gt  = [], [], []
-    x_tsg, y_tsg, hov_tsg = [], [], []
-    x_pri, y_pri, hov_pri = [], [], []
-
-    se_tsg, se_pri = [], []
-
-    for j, sid in enumerate(pristi_cols):
-        gt_col = ground_block[sid] if have_gt and (sid in (ground_block.columns if have_gt else [])) else None
-        for i, ts in enumerate(time_index):
-            if not bool(win_mask_df.iat[i, j]):   # uniquement les cellules imputées
-                continue
-
-            gt_val = float(gt_col.iat[i]) if (have_gt and pd.notna(gt_col.iat[i])) else np.nan
-            tsg    = float(ours_block.iat[i, j])  if pd.notna(ours_block.iat[i, j])  else np.nan
-            pri    = float(pristi_block.iat[i, j]) if pd.notna(pristi_block.iat[i, j]) else np.nan
-
-            # --- réel (vert) ---
-            if not np.isnan(gt_val):
-                x_gt.append(ts + OFF_GT); y_gt.append(gt_val)
-                hov_gt.append(f"Sensor {sid}<br>{ts}<br>Réel={gt_val:.3f}")
-
-            # --- TSGuard (bleu) ---
-            if not np.isnan(tsg):
-                if not np.isnan(gt_val):
-                    mse = (tsg - gt_val) ** 2; se_tsg.append(mse)
-                    hov_tsg.append(f"Sensor {sid}<br>{ts}<br>TSGuard={tsg:.3f}<br>GT={gt_val:.3f}<br>MSE={mse:.4f}")
-                else:
-                    hov_tsg.append(f"Sensor {sid}<br>{ts}<br>TSGuard={tsg:.3f}<br>GT=NA")
-                x_tsg.append(ts + OFF_TSG); y_tsg.append(tsg)
-
-            # --- PriSTI (rouge) ---
-            if not np.isnan(pri):
-                if not np.isnan(gt_val):
-                    mse = (pri - gt_val) ** 2; se_pri.append(mse)
-                    hov_pri.append(f"Sensor {sid}<br>{ts}<br>PriSTI={pri:.3f}<br>GT={gt_val:.3f}<br>MSE={mse:.4f}")
-                else:
-                    hov_pri.append(f"Sensor {sid}<br>{ts}<br>PriSTI={pri:.3f}<br>GT=NA")
-                x_pri.append(ts + OFF_PRI); y_pri.append(pri)
-
-    mse_tsg = float(np.mean(se_tsg)) if len(se_tsg) else float("nan")
-    mse_pri = float(np.mean(se_pri)) if len(se_pri) else float("nan")
-
-    title = "PriSTI vs TSGuard — points imputés (triplets GT/TSG/PriSTI)"
-    if not np.isnan(mse_tsg) or not np.isnan(mse_pri):
-        title += f" • MSE(TSG)={mse_tsg:.3f} • MSE(PriSTI)={mse_pri:.3f}"
-    if title_suffix:
-        title += f" {title_suffix}"
-
-    fig = go.Figure()
-
-    # Réel = VERT
-    fig.add_trace(go.Scatter(
-        x=x_gt, y=y_gt, mode="markers", name="Réel (ground)",
-        marker=dict(size=8, color="green", opacity=0.9),
-        hovertemplate="%{text}", text=hov_gt, showlegend=True
-    ))
-    # TSGuard = BLEU
-    fig.add_trace(go.Scatter(
-        x=x_tsg, y=y_tsg, mode="markers", name="TSGuard (imputed)",
-        marker=dict(size=7, color="#1f77b4", opacity=0.9),
-        hovertemplate="%{text}", text=hov_tsg, showlegend=True
-    ))
-    # PriSTI = ROUGE
-    fig.add_trace(go.Scatter(
-        x=x_pri, y=y_pri, mode="markers", name="PriSTI (imputed)",
-        marker=dict(size=7, color="red", opacity=0.9),
-        hovertemplate="%{text}", text=hov_pri, showlegend=True
-    ))
-
-    fig.update_layout(
-        title=title,
-        xaxis_title="Time",
-        yaxis_title="Sensor value",
-        margin=dict(l=10, r=10, t=48, b=10),
-        uirevision="pristi_cmp_triplet",
-        legend_title="Séries",
-    )
-
-    ts_key = int(pd.Timestamp(time_index[-1]).value)
-    ph.plotly_chart(fig, use_container_width=True, key=f"cmp_triplet_{ts_key}")
-
-def _avg_mse_per_timestamp_pair(
-    ours_block: pd.DataFrame,
-    pristi_block: pd.DataFrame,
-    ground_block: Optional[pd.DataFrame],
-    win_mask_df: pd.DataFrame
-) -> tuple[pd.Series, pd.Series]:
-    idx_time = ours_block.index
-    if ground_block is None or ground_block.empty:
-        nan_series = pd.Series(np.nan, index=idx_time, dtype="float64")
-        return nan_series, nan_series
-
-    e1 = ours_block.to_numpy(dtype="float64")    # TSGuard
-    e2 = pristi_block.to_numpy(dtype="float64")  # PriSTI
-    gt = ground_block.to_numpy(dtype="float64")
-    m  = win_mask_df.to_numpy(dtype=bool)
-
-    f1 = np.isfinite(e1); f2 = np.isfinite(e2); fg = np.isfinite(gt)
-    T  = e1.shape[0]
-    out1 = np.full(T, np.nan, dtype="float64")
-    out2 = np.full(T, np.nan, dtype="float64")
-
-    for t in range(T):
-        common = m[t] & f1[t] & f2[t] & fg[t]
-        if common.any():
-            d1 = e1[t, common] - gt[t, common]
-            d2 = e2[t, common] - gt[t, common]
-            out1[t] = float(np.mean(d1 * d1))
-            out2[t] = float(np.mean(d2 * d2))
-    return pd.Series(out1, index=idx_time), pd.Series(out2, index=idx_time)
 
 def render_pristi_window_only(
     ph,
@@ -1258,8 +985,16 @@ def render_pristi_window_only(
     title_suffix: str = "",
 ):
     # palette fixe
-    palette = ["#000000", "#003366", "#009999", "#006600", "#66CC66",
-               "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"]
+    palette = [
+        "#000000", "#003366", "#009999", "#006600", "#66CC66",
+        "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33",
+        "#1F77B4", "#5DA5DA", "#1E90FF", "#00BFFF", "#00CED1",
+        "#17BECF", "#40E0D0", "#20B2AA", "#16A085", "#1ABC9C",
+        "#2ECC71", "#3CB371", "#2CA02C", "#00FA9A", "#7FFFD4",
+        "#ADFF2F", "#F1C40F", "#F4D03F", "#B7950B", "#4B0082",
+        "#6A5ACD", "#7B68EE", "#483D8B", "#3F51B5", "#2E4057",
+        "#A9A9A9"
+    ]
     sensor_color_map = {c: palette[i % len(palette)] for i, c in enumerate(pristi_cols)}
 
     # aligne les grilles
@@ -1348,75 +1083,6 @@ def _window_lines(fig: go.Figure,
                              marker=dict(size=8, color="red"),
                              showlegend=True, name="Imputed segment"))
 
-
-def render_pristi_window_plus_mse(
-    ph,
-    time_index: pd.DatetimeIndex,
-    pristi_cols: list,
-    ours_block: pd.DataFrame,          # TSGuard window values (T,N) for MSE only
-    pristi_block: pd.DataFrame,        # PriSTI window values (T,N)
-    win_mask_df: pd.DataFrame,         # originally-missing mask (T,N)
-    ground_block: pd.DataFrame = None, # real window (T,N)
-    title_suffix: str = "",
-):
-    # --- align everything to the same (T,N) grid ---
-    pristi_block = pristi_block.reindex(index=time_index, columns=pristi_cols)
-    ours_block   = ours_block.reindex(index=time_index, columns=pristi_cols)
-    win_mask_df  = win_mask_df.reindex(index=time_index, columns=pristi_cols).fillna(False)
-    if ground_block is not None:
-        ground_block = ground_block.reindex(index=time_index, columns=pristi_cols)
-
-    # palette…
-    palette = ["#000000", "#003366", "#009999", "#006600", "#66CC66",
-               "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"]
-    sensor_color_map = {c: palette[i % len(palette)] for i, c in enumerate(pristi_cols)}
-
-    # ----- PriSTI window (on n’affiche plus la fenêtre TSGuard)
-    fig_pri = go.Figure()
-    fig_pri.update_layout(
-        title=None,
-        xaxis_title="Time", yaxis_title="Sensor value",
-        margin=dict(l=10, r=10, t=40, b=10),
-        uirevision="pristi_only",
-    )
-    _window_lines(fig_pri, pristi_block, win_mask_df, pristi_cols, sensor_color_map)
-
-    # --- Avg MSE sur masque commun ---
-    mse_tsg, mse_pri = _avg_mse_per_timestamp_pair(
-        ours_block=ours_block,
-        pristi_block=pristi_block,
-        ground_block=ground_block,
-        win_mask_df=win_mask_df,
-    )
-
-    fig_mse = go.Figure()
-    fig_mse.add_trace(go.Scatter(
-        x=mse_tsg.index, y=mse_tsg.values,
-        mode="lines+markers", name="TSGuard MSE",
-        connectgaps=False
-    ))
-    fig_mse.add_trace(go.Scatter(
-        x=mse_pri.index, y=mse_pri.values,
-        mode="lines+markers", name="PriSTI MSE",
-        connectgaps=False
-    ))
-    fig_mse.update_layout(
-        title="Avg MSE per timestamp (masked cells)",
-        xaxis_title="Time", yaxis_title="MSE",
-        margin=dict(l=10, r=10, t=40, b=10),
-        uirevision="mse_cmp",
-        yaxis=dict(rangemode="tozero"),
-    )
-
-    # ----- layout: 2 colonnes (PriSTI | MSE)
-    ph.empty()
-    cont = ph.container()
-    c1, c2 = cont.columns([3, 2])
-
-    ts_key = f"{int(pd.Timestamp(time_index[-1]).value)}"
-
-    c1.plotly_chart(fig_pri, use_container_width=True, key=f"pri_win_only_{ts_key}")
-    c2.plotly_chart(fig_mse, use_container_width=True, key=f"mse_cmp_{ts_key}")
 
 def run_simulation_with_live_imputation(
     sim_df: pd.DataFrame,
@@ -1639,7 +1305,7 @@ def run_simulation_with_live_imputation(
         col_left, col_right = st.columns([3, 1], gap="small")
 
         with col_left:
-            st.markdown("### Sensor Simulation Graph")
+            st.markdown("### Sensor Visualization")
             hdr_l, hdr_r = st.columns([5, 2], gap="small")
             with hdr_l:
                 SS["ph_time"] = st.markdown("**Current Time:** —")
@@ -1904,7 +1570,7 @@ def run_simulation_with_live_imputation(
                     fig_tsg = go.Figure(); _window_lines(fig_tsg, tsg_show, mask_show, cmp_color_map)
                     fig_pri = go.Figure(); _window_lines(fig_pri, pri_show, mask_show, cmp_color_map)
                     for fig in (fig_tsg, fig_pri):
-                        fig.update_layout(title=None, xaxis_title="Time", yaxis_title="Value",
+                        fig.update_layout(title="", xaxis_title="Time", yaxis_title="Value",
                                           margin=dict(l=10, r=10, t=20, b=10))
 
                     tsg_ms = SS["impute_time_tsg"].get(ts, 0) * 1000.0
@@ -1953,7 +1619,7 @@ def run_simulation_with_live_imputation(
         active_now = len(sensor_cols) - missed_now
 
         SS["ph_counts_active"].markdown(f"Active sensors now: **{active_now}**")
-        SS["ph_counts_missing"].markdown(f"Missed sensors now: **{missed_now}**")
+        SS["ph_counts_missing"].markdown(f"Delayed sensors now: **{missed_now}**")
 
         # Gauge shows MISSED DATA (%) cumulatively
         gauge_fig = go.Figure(go.Indicator(
@@ -1972,7 +1638,7 @@ def run_simulation_with_live_imputation(
                 ],
             },
         ))
-        gauge_fig.update_layout(margin=dict(l=10, r=10, t=30, b=10))
+        gauge_fig.update_layout(title="",margin=dict(l=10, r=10, t=30, b=10))
         lightify(gauge_fig)
         SS["ph_gauge"].plotly_chart(gauge_fig, use_container_width=True, key=f"{uid}_gauge_{iter_key}")
 
