@@ -1,6 +1,9 @@
+from __future__ import annotations
 import pickle
 import torch
 import torch.nn as nn
+from streamlit import title
+from sympy import false
 from torch.utils.data import DataLoader, Dataset
 import models.sim_helper as helper
 import streamlit as st
@@ -62,7 +65,204 @@ ICON_SPEC = {
     "anchorX": ICON_W // 2,   # center the icon at the point
     "anchorY": ICON_H // 2
 }
-import plotly.io as pio
+
+# ===================== Constraint & Scenario Helpers =====================
+
+def _month_name_from_ts(ts: pd.Timestamp) -> str:
+    return ts.strftime("%B")  # "January", "February", ...
+
+def _neighbors_within_km(latlng_df: pd.DataFrame, km: float) -> dict[str, list[str]]:
+    """Build neighbor lists by distance threshold (km). Keys are sensor_id (string)."""
+    ids = latlng_df["sensor_id"].astype(str).tolist()
+    lat = latlng_df["latitude"].astype(float).to_numpy()
+    lon = latlng_df["longitude"].astype(float).to_numpy()
+
+    # simple O(N^2) because N is small on screen; fine for UI
+    neigh = {sid: [] for sid in ids}
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            d = haversine_distance(lat[i], lon[i], lat[j], lon[j])
+            if d <= km:
+                a, b = ids[i], ids[j]
+                neigh[a].append(b)
+                neigh[b].append(a)
+    return neigh
+
+def _check_value_against_constraints(
+    sensor_id: str,
+    value: float,
+    ts: pd.Timestamp,
+    constraints: list[dict],
+) -> list[str]:
+    """
+    Returns a list of violation labels for this sensor's *own* constraints (no neighbor diffs here).
+    Currently supports your Temporal constraints, e.g.:
+      {"type":"Temporal","month":"January","option":"Greater than","temp_threshold":50.0}
+    """
+    if value is None or (isinstance(value, float) and not np.isfinite(value)):
+        return []
+
+    vios = []
+    month_name = _month_name_from_ts(ts)
+    for c in constraints:
+        if c.get("type") != "Temporal":
+            continue
+        if c.get("month") != month_name:
+            continue
+        opt = c.get("option", "").lower()
+        thr = float(c.get("temp_threshold", np.nan))
+        if not np.isfinite(thr):
+            continue
+
+        if opt.startswith("greater"):
+            if not (value > thr):
+                vios.append(f"Temporal: expected > {thr}, got {value:.2f}")
+        elif opt.startswith("less"):
+            if not (value < thr):
+                vios.append(f"Temporal: expected < {thr}, got {value:.2f}")
+    return vios
+
+def _check_spatial_diffs_at_timestamp(
+    ts: pd.Timestamp,
+    latlng_df: pd.DataFrame,
+    values_by_sensor: dict[str, float],
+    constraints: list[dict],
+) -> list[str]:
+    """
+    Checks all *Spatial* constraints at timestamp ts.
+    For each spatial constraint: if two sensors are within 'distance in km', then |diff| must be <= 'diff'.
+    Returns violation messages like "Spatial: |S1-S2| 7.3 > 5.0 (≤2.0km)".
+    """
+    msgs = []
+    spatial_cs = [c for c in constraints if c.get("type") == "Spatial"]
+    if not spatial_cs or latlng_df.empty:
+        return msgs
+
+    # Precompute once per distinct km
+    km_to_neighbors = {}
+    for c in spatial_cs:
+        km = float(c.get("distance in km", 0))
+        if km <= 0:
+            continue
+        if km not in km_to_neighbors:
+            km_to_neighbors[km] = _neighbors_within_km(latlng_df, km)
+
+    for c in spatial_cs:
+        km = float(c.get("distance in km", 0))
+        max_diff = float(c.get("diff", np.nan))
+        if km <= 0 or not np.isfinite(max_diff):
+            continue
+        neigh = km_to_neighbors.get(km, {})
+        for sid, nlist in neigh.items():
+            v1 = values_by_sensor.get(sid)
+            if v1 is None or not np.isfinite(v1):
+                continue
+            for nid in nlist:
+                v2 = values_by_sensor.get(nid)
+                if v2 is None or not np.isfinite(v2):
+                    continue
+                d = abs(v1 - v2)
+                if d > max_diff:
+                    msgs.append(f"Spatial: |{sid}-{nid}| {d:.2f} > {max_diff:.2f} (≤{km:.1f} km)")
+    return msgs
+from typing import Optional
+def evaluate_constraints_and_scenarios(
+    ts: pd.Timestamp,
+    latlng_mapped: pd.DataFrame,     # expects columns: sensor_id, data_col, latitude, longitude
+    baseline_row_ts: pd.Series,      # True where *originally missing* at ts (indexed by data_col)
+    values_by_data_col: dict[str, float],   # values after your imputation logic; keys = data_col
+    imputed_mask_row: Optional[pd.Series],     # True where you imputed at ts (indexed by data_col)
+    constraints: list[dict],
+    sigma_minutes: float,
+    missing_streak_hours: dict[str, int],   # keeps how long (hours) each data_col has been missing
+) -> list[tuple[str, str]]:
+    """
+    Returns a list of alerts as (level, message).
+      level ∈ {"info","warning","error"}
+    Does NOT alter your plotting; only emits messages describing Scenario 1/2/3 and constraint violations.
+    """
+
+    alerts = []
+
+    # --- Build dictionaries keyed by *display sensor_id* ---
+    # data_col = the column name used in df; sensor_id = display name from positions
+    # We’ll evaluate spatial on sensor_id (geometry) and temporal on its own value.
+    sid_to_val = {}
+    sid_to_missing = {}
+    sid_to_imputed = {}
+
+    for _, r in latlng_mapped.iterrows():
+        sid = str(r["sensor_id"])
+        col = str(r["data_col"])
+        sid_to_val[sid] = values_by_data_col.get(col, np.nan)
+        sid_to_missing[sid] = bool(baseline_row_ts.get(col, False))
+        if imputed_mask_row is not None:
+            sid_to_imputed[sid] = bool(imputed_mask_row.get(col, False))
+        else:
+            sid_to_imputed[sid] = False
+
+    # --- Temporal checks per sensor (own constraints) ---
+    for sid, val in sid_to_val.items():
+        vios = _check_value_against_constraints(sid, val, ts, constraints)
+        for v in vios:
+            alerts.append(("warning", f"⏳ {sid} @ {ts}: {v}"))
+
+    # --- Spatial checks (pairwise diffs) ---
+    spatial_vios = _check_spatial_diffs_at_timestamp(ts, latlng_mapped[["sensor_id","latitude","longitude"]], sid_to_val, constraints)
+    for msg in spatial_vios:
+        alerts.append(("warning", f"📍 {ts}: {msg}"))
+
+    # --- Scenario classification per sensor, based on delay + neighbor availability ---
+    sigma_hours = max(0.0, float(sigma_minutes) / 60.0)
+
+    # precompute neighbors using the *widest* spatial constraint (if any)
+    spat = [c for c in constraints if c.get("type") == "Spatial" and float(c.get("distance in km", 0)) > 0]
+    max_km = max((float(c["distance in km"]) for c in spat), default=0.0)
+    neigh_idx = _neighbors_within_km(latlng_mapped[["sensor_id","latitude","longitude"]], max_km) if max_km > 0 else {}
+
+    # Helper to check if “neighbors available” = any neighbor has originally-present value at this ts
+    present_sids = {sid for sid, miss in sid_to_missing.items() if not miss}
+
+    for _, r in latlng_mapped.iterrows():
+        sid = str(r["sensor_id"])
+        col = str(r["data_col"])
+
+        is_missing = sid_to_missing.get(sid, False)
+        streak_h = float(missing_streak_hours.get(col, 0))
+        neighbors = neigh_idx.get(sid, []) if max_km > 0 else []
+
+        if not is_missing:
+            continue  # scenario classification concerns missing-at-ts only
+
+        if streak_h < sigma_hours:
+            alerts.append(("info", f"🕒 Scenario 1 — {sid} @ {ts}: delay below Δt, waiting for late data."))
+        else:
+            # decide 2 vs 3 by neighbor availability
+            has_neighbor_present = any(n in present_sids for n in neighbors)
+            if has_neighbor_present:
+                # Scenario 2 — with neighbors; check sub-cases
+                val = sid_to_val.get(sid, np.nan)
+                own_vios = _check_value_against_constraints(sid, val, ts, constraints)
+                # neighbor vios are already pushed above; check simple logic for sub-cases:
+                neighbors_vals = [(n, sid_to_val.get(n, np.nan)) for n in neighbors]
+                # consider neighbor temporal violations too:
+                any_neigh_vio = False
+                for n, nv in neighbors_vals:
+                    nvios = _check_value_against_constraints(n, nv, ts, constraints)
+                    if nvios:
+                        any_neigh_vio = True
+                        break
+
+                if not own_vios and not any_neigh_vio:
+                    alerts.append(("info", f"✅ Scenario 2.1 — {sid} @ {ts}: imputed within range; neighbors in range."))
+                elif own_vios:
+                    alerts.append(("error", f"🚨 Scenario 2.2 — {sid} @ {ts}: imputed value violates constraints ({'; '.join(own_vios)})."))
+                elif any_neigh_vio:
+                    alerts.append(("warning", f"⚠️ Scenario 2.3 — {sid} @ {ts}: neighbors out-of-range; possible masked anomaly."))
+            else:
+                # Scenario 3 — no neighbors
+                alerts.append(("warning", f"🛰️ Scenario 3 — {sid} @ {ts}: neighbors unavailable; fallback to history."))
+    return alerts
 
 
 def init_sensor_map(latlng_df):
@@ -765,6 +965,7 @@ def draw_full_time_series_with_mask_gap(global_df, imputed_mask, sensor_cols, se
         showlegend=True, name="Imputed segment"
     ))
     fig.update_layout(
+        title_text="Global Sensors Time Series",
         xaxis_title="Time", yaxis_title="Sensor Value",
         margin=dict(l=20, r=20, t=40, b=20),
         legend_title="Sensors",
@@ -1084,6 +1285,134 @@ def _window_lines(fig: go.Figure,
                              showlegend=True, name="Imputed segment"))
 
 
+def verify_constraints_and_alerts_for_timestamp(
+    ts: pd.Timestamp,
+    latlng_df: pd.DataFrame,
+    values_by_col: dict,
+    imputed_mask_row: pd.Series | None,      # index = sensor_cols
+    baseline_row: pd.Series,          # index = sensor_cols (manquait à l’origine)
+    missing_streak_hours: dict | None = None,   # {sensor_id: hours_without_value_when_missing}
+):
+    import numpy as np
+    import streamlit as st
+    from utils.config import DEFAULT_VALUES
+
+    constraints = st.session_state.get("constraints", [])
+    sigma_minutes = float(st.session_state.get("sigma_threshold", DEFAULT_VALUES.get("sigma_threshold", 30)))
+    sigma_hours = max(0.0, sigma_minutes / 60.0)
+
+    # états persistants pour anti-spam
+    if "_fault_state" not in st.session_state:
+        # state ∈ {"ok","waiting","fault"}
+        st.session_state["_fault_state"] = {}
+    fault_state = st.session_state["_fault_state"]
+
+    # placeholder persistant
+    if "_alerts_ph" not in st.session_state:
+        st.session_state["_alerts_ph"] = st.container()
+    alerts = st.session_state["_alerts_ph"]
+
+    # on n’utilise pas les contraintes s’il n’y en a pas ; on garde la logique scenarios
+    spatial_rules  = [c for c in constraints if c.get("type") == "Spatial"]
+    temporal_rules = [c for c in constraints if c.get("type") == "Temporal"]
+
+    # mapping positions (seulement si on a besoin de spatial)
+    if spatial_rules:
+        pos_map = {
+            str(row["data_col"]): (float(row["latitude"]), float(row["longitude"]))
+            for _, row in latlng_df.iterrows()
+            if str(row.get("data_col")) in values_by_col
+        }
+        def haversine_km(lat1, lon1, lat2, lon2):
+            from math import radians, sin, cos, sqrt, atan2
+            R = 6371.0
+            dlat = radians(lat2 - lat1); dlon = radians(lon2 - lon1)
+            a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+            return 2 * R * atan2(sqrt(a), sqrt(1 - a))
+
+    messages = []
+
+    for sid, val in values_by_col.items():
+        v = None if (val is None or (isinstance(val, float) and np.isnan(val))) else float(val)
+        was_missing = bool(baseline_row.get(sid, False))
+        is_imputed  = bool(imputed_mask_row.get(sid, False))
+        streak_h    = float((missing_streak_hours or {}).get(sid, 0.0))
+
+        prev = fault_state.get(sid, "ok")
+        curr = prev  # par défaut
+
+        # ---- Scénario 1 vs 3 (sans contraintes)
+        if was_missing and (v is None) and not is_imputed:
+            # pas d’estimation à ce timestamp
+            if streak_h < sigma_hours:
+                curr = "waiting"
+                # n’alerter qu’au changement d’état
+                if prev != "waiting":
+                    messages.append(("info", f"⏳ {sid}: waiting for late data @ {ts} (delay below Δt)."))
+            else:
+                curr = "fault"
+                if prev != "fault":
+                    messages.append(("warning", f"⚠️ {sid}: no reliable estimate @ {ts}. Possible sensor/network fault."))
+        else:
+            # valeur disponible (réelle ou imputée)
+            curr = "ok"
+            if prev in ("waiting", "fault"):
+                messages.append(("success", f"✅ {sid}: value available again @ {ts}."))
+
+        # ---- Contraintes temporelles (optionnel – seulement si définies)
+        if temporal_rules and (v is not None):
+            mo_name = ts.strftime("%B")
+            for rule in temporal_rules:
+                if rule.get("month") != mo_name:
+                    continue
+                opt = rule.get("option")
+                thr = rule.get("temp_threshold", None)
+                try:
+                    thr = float(thr)
+                except Exception:
+                    continue
+                if opt == "Greater than" and not (v > thr):
+                    messages.append(("warning", f"🚨 {sid} @ {ts}: value {v:.2f} ≤ {thr} in {mo_name}."))
+                if opt == "Less than" and not (v < thr):
+                    messages.append(("warning", f"🚨 {sid} @ {ts}: value {v:.2f} ≥ {thr} in {mo_name}."))
+
+        # ---- Contraintes spatiales (optionnel – seulement si définies)
+        if spatial_rules and (v is not None) and ('pos_map' in locals()) and (sid in pos_map):
+            lat1, lon1 = pos_map[sid]
+            for rule in spatial_rules:
+                try:
+                    dist_km  = float(rule.get("distance in km", 0))
+                    max_diff = float(rule.get("diff", np.inf))
+                except Exception:
+                    continue
+                for nid, nval in values_by_col.items():
+                    if nid == sid or nid not in pos_map:
+                        continue
+                    nv = None if (nval is None or (isinstance(nval, float) and np.isnan(nval))) else float(nval)
+                    if nv is None:
+                        continue
+                    lat2, lon2 = pos_map[nid]
+                    d = haversine_km(lat1, lon1, lat2, lon2)
+                    if d <= dist_km and abs(v - nv) > max_diff:
+                        messages.append(("warning",
+                            f"🚨 Spatial: {sid} vs {nid} @ {ts} (d≈{d:.1f} km): |Δ|={abs(v-nv):.2f} > {max_diff}"
+                        ))
+
+        # maj état
+        fault_state[sid] = curr
+
+    # rendu compact (et anti-spam)
+    with alerts:
+        for lvl, msg in messages:
+            if lvl == "success":
+                st.success(msg)
+            elif lvl == "warning":
+                st.warning(msg)
+            else:
+                st.info(msg)
+
+
+
 def run_simulation_with_live_imputation(
     sim_df: pd.DataFrame,
     missing_df: pd.DataFrame,
@@ -1276,26 +1605,8 @@ def run_simulation_with_live_imputation(
     init_once("impute_time_tsg", {})  # per-timestamp seconds
     init_once("impute_time_pri", {})
 
-    # ---------- PriSTI (optional) ----------
-    PRISTI_ROOT = "./PriSTI"
-    CONFIG_PATH = f"{PRISTI_ROOT}/config/base.yaml"
-    WEIGHTS_PATH = f"{PRISTI_ROOT}/save/aqi36/model.pth"
-    MEANSTD_PK   = f"{PRISTI_ROOT}/data/pm25/pm25_meanstd.pk"
-    all_cols_for_pristi = list(missing_df.columns)
-    have_36 = len(all_cols_for_pristi) >= 36
-    have_cfg = os.path.exists(CONFIG_PATH)
-    have_wts = os.path.exists(WEIGHTS_PATH)
-    have_ms  = os.path.exists(MEANSTD_PK)
-    if not (have_36 and have_cfg and have_wts and have_ms):
-        pristi_enabled = False
-    else:
-        pristi_enabled = True
-        pristi_cols = all_cols_for_pristi[:36]
-        pristi_model, pristi_mean, pristi_std = load_pristi_artifacts(CONFIG_PATH, WEIGHTS_PATH, MEANSTD_PK, device)
-        SS["pristi_model"] = pristi_model
-        SS["pristi_mean"]  = pristi_mean
-        SS["pristi_std"]   = pristi_std
-        init_once("pristi_running_df", missing_df.copy())
+
+
 
     # ---------- UI (created once) ----------
     if "_ui_inited" not in SS:
@@ -1335,31 +1646,7 @@ def run_simulation_with_live_imputation(
 
         st.markdown("---")
 
-        # Comparison panel with its own settings (top inside the panel)
-        with st.expander("TSGuard vs PriSTI — Comparison", expanded=False):
-            c1, c2 = st.columns(2)
-            with c1:
-                SS["cmp_sensors"] = st.slider(
-                    "Sensors to display (comparison only)",
-                    min_value=1, max_value=min(36, len(all_cols_for_pristi)),
-                    value=min(6, len(all_cols_for_pristi)),
-                    step=1, key=f"{uid}_cmp_nodes"
-                )
-            with c2:
-                SS["cmp_steps"] = st.slider(
-                    "Timestamps to display (≤36, last)",
-                    min_value=6, max_value=36, value=36, step=1, key=f"{uid}_cmp_steps"
-                )
-            st.caption("Please update the number of sensors and timestamps to display for the comparison.")
 
-            SS["ph_cmp_times"] = st.empty()
-            cc1, cc2 = st.columns(2)
-            with cc1:
-                st.markdown("**TSGuard**")
-                SS["ph_cmp_tsg"] = st.empty()
-            with cc2:
-                st.markdown("**PriSTI**")
-                SS["ph_cmp_pri"] = st.empty()
     # Render a single Fit button (in left header, aligned right)
     with SS["ph_fitbtn"]:
         # unique, stable key
@@ -1414,6 +1701,19 @@ def run_simulation_with_live_imputation(
                     "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"]
     sensor_color_map = {c: base_palette[i % len(base_palette)] for i, c in enumerate(sensor_cols)}
 
+
+    # add a place to show alerts (non-intrusive)
+    if "ph_alerts" not in SS:
+        SS["ph_alerts"] = st.empty()
+
+    # missing-streak tracker (by data_col) for scenario 1 thresholding
+    if "_missing_streak_hours" not in SS:
+        SS["_missing_streak_hours"] = {c: 0 for c in sensor_cols}
+    else:
+        # keep in sync with current selection
+        for c in sensor_cols:
+            SS["_missing_streak_hours"].setdefault(c, 0)
+
     # ---------- main loop (resume from pointer) ----------
     use_model = model is not None
     if use_model:
@@ -1440,18 +1740,18 @@ def run_simulation_with_live_imputation(
             hist_idx = missing_df.index[missing_df.index < ts][-window_hours:]
         hist_win = missing_df.loc[hist_idx, sensor_cols] if len(hist_idx) > 0 else pd.DataFrame()
 
-        # --- TSGuard imputation + time (baseline-aligned to map/counters) ---
+        # --- TSGuard imputation (alignée baseline) ---
         tsg_start = time.perf_counter()
-
-        # baseline "missing at ts" (True means originally missing at this timestamp)
         baseline_row_ts = SS.orig_missing_baseline.reindex(index=[ts], columns=sensor_cols).iloc[0]
 
         svals, sstatus = [], []
+
         for col in sensor_cols:
-            is_missing_now = bool(baseline_row_ts[col])  # ← authoritative mask for THIS timestamp
+            is_missing_now = bool(baseline_row_ts.get(col, False))
 
             if is_missing_now:
-                # Only impute because the ORIGINAL cell at ts was missing
+                pred_val = np.nan
+
                 if not hist_win.empty:
                     if use_model:
                         try:
@@ -1461,33 +1761,63 @@ def run_simulation_with_live_imputation(
                                 model=model, scaler=scaler, inv_scaler=inv_scaler, device=device
                             )
                         except Exception:
-                            last = pd.to_numeric(hist_win[col].dropna(), errors="coerce")
-                            pred_val = float(last.iloc[-1]) if len(last) else np.nan
-                    else:
+                            pred_val = np.nan
+                    if (not np.isfinite(pred_val)) or pd.isna(pred_val):
+                        # fallback: dernier réel dans l'historique
                         last = pd.to_numeric(hist_win[col].dropna(), errors="coerce")
                         pred_val = float(last.iloc[-1]) if len(last) else np.nan
 
-                    # write-back and store value/status
+                # write + flags
+                try:
                     missing_df.at[ts, col] = pred_val if pd.notna(pred_val) else np.nan
-                    svals.append(pred_val if pd.notna(pred_val) else np.nan)
-                    sstatus.append(False)  # red on map
-                    SS.imputed_mask.at[ts, col] = pd.notna(pred_val)
-                else:
-                    # No history to impute from
-                    svals.append(np.nan)
-                    sstatus.append(False)  # red on map
-                    SS.imputed_mask.at[ts, col] = False
+                except Exception:
+                    pass
+                svals.append(pred_val)
+                sstatus.append(False)                     # imputé (rouge sur la map)
+                SS.imputed_mask.at[ts, col] = pd.notna(pred_val)
 
             else:
-                # Originally present at ts: keep original value; map shows green
-                v = missing_df.at[ts, col]
+                # présent à l'origine → garder la valeur
+                v = missing_df.at[ts, col] if (ts in missing_df.index and col in missing_df.columns) else np.nan
                 svals.append(v)
-                sstatus.append(True)  # green on map
+                sstatus.append(True)                      # réel (vert sur la map)
                 SS.imputed_mask.at[ts, col] = False
 
         SS["impute_time_tsg"][ts] = time.perf_counter() - tsg_start
 
-        # display buffers
+        # Sécurité : parité des tailles
+        if len(svals)   < len(sensor_cols): svals   += [np.nan] * (len(sensor_cols) - len(svals))
+        if len(sstatus) < len(sensor_cols): sstatus += [False]  * (len(sensor_cols) - len(sstatus))
+
+        # ---- Dicts capteur -> valeur/état ----
+        vals_by_col = dict(zip(sensor_cols, svals))
+        real_by_col = dict(zip(sensor_cols, sstatus))
+        imputed_row = SS.imputed_mask.reindex(index=[ts], columns=sensor_cols, fill_value=False).iloc[0]
+
+        # --- Update missing streak (Scénario 1) ---
+        if "_missing_streak_hours" not in SS:
+            SS["_missing_streak_hours"] = {c: 0.0 for c in sensor_cols}
+
+        for c in sensor_cols:
+            originally_missing = bool(baseline_row_ts.get(c, False))
+            val_now = vals_by_col.get(c, np.nan)
+            no_value_now = (val_now is None) or (isinstance(val_now, float) and np.isnan(val_now))
+            # On incrémente uniquement quand il manquait à l’origine ET qu’on n’a toujours pas de valeur à afficher
+            if originally_missing and no_value_now:
+                SS["_missing_streak_hours"][c] = SS["_missing_streak_hours"].get(c, 0.0) + 1.0  # +1h par tick
+            else:
+                SS["_missing_streak_hours"][c] = 0.0
+
+        # ---- Vérification des contraintes & alertes (appelle TA fonction) ----
+        verify_constraints_and_alerts_for_timestamp(
+            ts=ts,
+            latlng_df=latlng[["sensor_id", "data_col", "latitude", "longitude"]],
+            values_by_col=vals_by_col,
+            imputed_mask_row=imputed_row,
+            baseline_row=baseline_row_ts,
+        )
+
+        # ---- Buffers de rendu (inchangé) ----
         row = {"datetime": ts}
         for i, c in enumerate(sensor_cols):
             row[c] = svals[i]
@@ -1496,101 +1826,21 @@ def run_simulation_with_live_imputation(
         if len(SS.sliding_window_df) > 36:
             SS.sliding_window_df = SS.sliding_window_df.tail(36)
 
-        # --- PriSTI window + time (if enabled) ---
-        if pristi_enabled:
-            try:
-                pristi_running_df = SS["pristi_running_df"]
-                end_loc = pristi_running_df.index.get_loc(ts)
-                EVAL_LENGTH = 36
-                if not isinstance(end_loc, slice) and (end_loc + 1) >= EVAL_LENGTH:
-                    start_loc = end_loc - (EVAL_LENGTH - 1)
-                    time_index = pristi_running_df.index[start_loc:end_loc + 1]
-
-                    pri_start = time.perf_counter()
-                    updated_df, info = impute_window_with_pristi(
-                        missing_df=pristi_running_df.copy(),
-                        sensor_cols=pristi_cols,
-                        target_timestamp=ts,
-                        model=SS["pristi_model"],
-                        device=device, eval_len=EVAL_LENGTH, nsample=100
-                    )
-                    SS["impute_time_pri"][ts] = time.perf_counter() - pri_start
-
-                    if info == "ok":
-                        pristi_running_df.loc[time_index, pristi_cols] = updated_df.loc[time_index, pristi_cols].values
-                        SS["pristi_running_df"] = pristi_running_df
-
-                    # ------ comparison (display only; compute once above) ------
-                    cmp_nodes = int(SS.get("cmp_sensors", min(6, len(pristi_cols))))
-                    cmp_steps = max(6, min(36, int(SS.get("cmp_steps", 36))))
-                    cols_show = pristi_cols[:cmp_nodes]
-
-                    win_mask_df = SS.orig_missing_baseline.reindex(index=time_index, columns=pristi_cols).fillna(False)
-                    tsg_block = missing_df.loc[time_index, pristi_cols].copy()
-                    pri_block = pristi_running_df.loc[time_index, pristi_cols].copy()
-
-                    # >>> ADD (build PriSTI display that respects originals)
-                    base_block = SS.orig_missing_values.loc[time_index, pristi_cols].copy()  # frozen originals
-                    display_block = base_block.copy()
-                    display_block[win_mask_df] = pri_block[win_mask_df]  # substitute only on originally-missing cells
-                    # <<< END ADD
-
-                    tsg_show = tsg_block.iloc[-cmp_steps:, :][cols_show]
-                    pri_show = display_block.iloc[-cmp_steps:, :][cols_show]
-                    mask_show = win_mask_df.iloc[-cmp_steps:, :][cols_show]
-
-                    def _window_lines(fig, block, mask_df, color_map, gap_hours=6):
-                        sub_df = block.reset_index()
-                        first_col = sub_df.columns[0]
-                        if first_col != "datetime":
-                            sub_df = sub_df.rename(columns={first_col: "datetime"})
-                        for col in block.columns:
-                            base_color = color_map.get(col, "#444")
-                            xy = (sub_df[["datetime", col]].dropna()
-                                  .sort_values("datetime").rename(columns={col: "value"}))
-                            if xy.empty:
-                                continue
-                            def is_imp(t):
-                                try: return bool(mask_df.loc[t, col])
-                                except: return False
-                            add_imputed_segments(fig, xy, is_imp, base_color, gap_hours=gap_hours)
-                        for col in block.columns:
-                            fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
-                                                     marker=dict(size=8, color=color_map.get(col, "#444")),
-                                                     showlegend=True, name=f"{col}"))
-                        fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
-                                                 marker=dict(size=8, color="red"),
-                                                 showlegend=True, name="Imputed segment"))
-
-                    cmp_palette = ["#000000", "#003366", "#009999", "#006600", "#66CC66",
-                                   "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"]
-                    cmp_color_map = {c: cmp_palette[i % len(cmp_palette)] for i, c in enumerate(cols_show)}
-
-
-                    fig_tsg = go.Figure(); _window_lines(fig_tsg, tsg_show, mask_show, cmp_color_map)
-                    fig_pri = go.Figure(); _window_lines(fig_pri, pri_show, mask_show, cmp_color_map)
-                    for fig in (fig_tsg, fig_pri):
-                        fig.update_layout(title="", xaxis_title="Time", yaxis_title="Value",
-                                          margin=dict(l=10, r=10, t=20, b=10))
-
-                    tsg_ms = SS["impute_time_tsg"].get(ts, 0) * 1000.0
-                    pri_ms = SS["impute_time_pri"].get(ts, 0) * 1000.0
-                    SS["ph_cmp_times"].markdown(
-                        f"**Imputation time @ {ts}** — TSGuard: {tsg_ms:.1f} ms • PriSTI: {pri_ms:.1f} ms"
-                    )
-                    lightify(fig_pri)
-                    lightify(fig_tsg)
-
-                    SS["ph_cmp_tsg"].plotly_chart(fig_tsg, use_container_width=True, key=f"{uid}_cmp_tsg_{iter_key}")
-                    SS["ph_cmp_pri"].plotly_chart(fig_pri, use_container_width=True, key=f"{uid}_cmp_pri_{iter_key}")
-
-
-            except Exception as e:
-                st.caption(f"PriSTI error @ {ts}: {e}")
 
         # --- Map update & store base for next Fit ---
-        vals_by_col = {col: svals[i] for i, col in enumerate(sensor_cols)}
-        real_by_col = {col: sstatus[i] for i, col in enumerate(sensor_cols)}
+        # --- juste avant la mise à jour de la carte ---
+        # (garde les mêmes noms de variables que ton code)
+        if len(svals) != len(sensor_cols) or len(sstatus) != len(sensor_cols):
+            if not st.session_state.get("_warned_len_mismatch", False):
+                st.warning(
+                    f"[Guard] Mismatch tailles — sensors={len(sensor_cols)}, svals={len(svals)}, sstatus={len(sstatus)}. "
+                    "On complète seulement ce tick."
+                )
+                st.session_state["_warned_len_mismatch"] = True
+
+        # mapping sûr (pas d'IndexError); les capteurs sans valeur recevront NaN/False et la map affichera 'NA'
+        vals_by_col = dict(zip(sensor_cols, svals))
+        real_by_col = dict(zip(sensor_cols, sstatus))
         tick_df = latlng.copy()
         tick_df["value"]  = tick_df["data_col"].map(vals_by_col).fillna("NA")
         tick_df["status"] = tick_df["data_col"].map(lambda c: "Real" if real_by_col.get(c, False) else "Predicted")
@@ -1643,8 +1893,7 @@ def run_simulation_with_live_imputation(
         SS["ph_gauge"].plotly_chart(gauge_fig, use_container_width=True, key=f"{uid}_gauge_{iter_key}")
 
         # --- Global TS ---
-        full_ts_fig = draw_full_time_series_with_mask_gap(
-            SS.global_df.copy(), SS.imputed_mask, sensor_cols, sensor_color_map)
+        full_ts_fig = draw_full_time_series_with_mask_gap(SS.global_df.copy(), SS.imputed_mask, sensor_cols, sensor_color_map)
         lightify(full_ts_fig)
         SS["ph_global"].plotly_chart(full_ts_fig, use_container_width=True, key=f"{uid}_global_{iter_key}")
 
@@ -1673,3 +1922,245 @@ def run_simulation_with_live_imputation(
         ptr += 1
         SS["sim_ptr"] = ptr
         time.sleep(1)
+
+def run_tsguard_vs_pristi_comparison(
+    sim_df: pd.DataFrame,
+    missing_df: pd.DataFrame,
+    model: torch.nn.Module,
+    scaler: callable,
+    inv_scaler: callable,
+    device: torch.device,
+    eval_len: int = 36,
+    window_hours: int = 24,
+):
+    import time
+    import numpy as np
+    import pandas as pd
+    import plotly.graph_objects as go
+    import streamlit as st
+    from utils.config import DEFAULT_VALUES
+    def _last_observed(hist_df: pd.DataFrame, col: str) -> float:
+        if hist_df.empty or col not in hist_df.columns:
+            return np.nan
+        s = pd.to_numeric(hist_df[col].dropna(), errors="coerce")
+        return float(s.iloc[-1]) if len(s) else np.nan
+
+    SS = st.session_state
+    print("Running TSGuard vs PTISTI")
+
+    # --- Header & notices ---
+    st.markdown("## TSGuard vs PriSTI — Comparison")
+    st.warning("⚠️ The comparison can be long because PriSTI computation is heavy.", icon="⚠️")
+    ph_status = st.info("⏳ Preparing the first window…", icon="⏳")
+
+    # ---------- Align time & columns (same as your sim) ----------
+    def ensure_datetime(df: pd.DataFrame, name: str) -> pd.DataFrame:
+        if "datetime" in df.columns:
+            df = df.copy(); df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+            df = df.dropna(subset=["datetime"]).set_index("datetime")
+        else:
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df = df.copy(); df.index = pd.to_datetime(df.index, errors="coerce")
+                df = df[~df.index.isna()]
+        df.index = df.index.floor("h")
+        df = df[~df.index.duplicated(keep="first")].sort_index()
+        return df
+
+    sim_df     = ensure_datetime(sim_df, "sim_df")
+    missing_df = ensure_datetime(missing_df, "missing_df")
+
+    def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        out.columns = [(str(c).strip().zfill(6) if str(c).isdigit() else str(c).strip()) for c in out.columns]
+        return out
+
+    sim_df = _norm_cols(sim_df)
+    missing_df = _norm_cols(missing_df)
+
+    # columns like your sim (keep order)
+    all_sensor_cols = [c for c in sim_df.columns if c != "datetime"]
+    graph_size = int(SS.get("graph_size", DEFAULT_VALUES["graph_size"]))
+    sensor_cols = [str(c) for c in all_sensor_cols[:graph_size]]
+
+    # baseline: originally missing
+    orig_missing_baseline = missing_df.isna().copy()
+    # keep ORIGINAL values for PriSTI display
+    orig_values_frozen = missing_df.copy()
+
+    # reindex both on common timeline
+    common_index = missing_df.index
+    sim_df = sim_df.reindex(common_index)
+    if common_index.empty:
+        st.info("No timeline to compare."); return
+
+    # PriSTI artifacts (as in your helpers)
+    PRISTI_ROOT = "./PriSTI"
+    CONFIG_PATH = f"{PRISTI_ROOT}/config/base.yaml"
+    WEIGHTS_PATH = f"{PRISTI_ROOT}/save/aqi36/model.pth"
+    MEANSTD_PK   = f"{PRISTI_ROOT}/data/pm25/pm25_meanstd.pk"
+    pristi_ready = (len(missing_df.columns) >= 36
+                    and os.path.exists(CONFIG_PATH)
+                    and os.path.exists(WEIGHTS_PATH)
+                    and os.path.exists(MEANSTD_PK))
+    if not pristi_ready:
+        st.error("PriSTI backend not available (need config/weights/meanstd and ≥36 sensors)."); return
+
+    pristi_cols = list(missing_df.columns)[:36]
+    pristi_model, pristi_mean, pristi_std = load_pristi_artifacts(CONFIG_PATH, WEIGHTS_PATH, MEANSTD_PK, device)
+    SS["pristi_model"] = pristi_model; SS["pristi_mean"] = pristi_mean; SS["pristi_std"] = pristi_std
+
+    # Regulators (keep your logic / names)
+    c1, c2 = st.columns(2)
+    with c1:
+        cmp_sensors = st.slider("Sensors to display", 1, min(36, len(pristi_cols)),
+                                min(6, len(pristi_cols)), key="cmp_sensors")
+    with c2:
+        cmp_steps = st.slider("Timestamps to display (≤36, last)", 6, 36, 36, key="cmp_steps")
+
+    # Output areas
+    ph_times = st.empty()
+    lcol, rcol = st.columns(2)
+    ph_tsg = lcol.empty()
+    ph_pri = rcol.empty()
+
+    # Buffers (comparison runs from zero; no map/other charts)
+    tsg_running_df   = missing_df.copy()
+    pristi_running_df = missing_df.copy()
+
+    # color palette for lines
+    base_palette = [
+        "#000000", "#003366", "#009999", "#006600", "#66CC66",
+        "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"
+    ]
+    color_map = {c: base_palette[i % len(base_palette)] for i, c in enumerate(pristi_cols)}
+
+    # iteration from the beginning
+    col_to_idx = {c: i for i, c in enumerate(sensor_cols)}
+    use_model = model is not None
+    if use_model: model.eval()
+
+    start_time = time.perf_counter()
+    first_window_done = False
+
+    for i, ts in enumerate(common_index):
+        ts = pd.Timestamp(ts)
+
+        # ---- TSGuard: impute ONLY where originally missing at ts (your logic) ----
+        hist_end = ts - pd.Timedelta(hours=1)
+        if hist_end in tsg_running_df.index:
+            hist_idx = tsg_running_df.loc[:hist_end].index[-window_hours:]
+        else:
+            hist_idx = tsg_running_df.index[tsg_running_df.index < ts][-window_hours:]
+        if len(hist_idx) > 0:
+            hist_win = tsg_running_df.loc[hist_idx, sensor_cols].copy()
+        else:
+            # DataFrame vide MAIS avec les mêmes colonnes pour éviter KeyError
+            hist_win = pd.DataFrame(columns=sensor_cols)
+
+        baseline_row = orig_missing_baseline.reindex(index=[ts], columns=sensor_cols).iloc[0]
+        for col in sensor_cols:
+            if bool(baseline_row[col]):  # originally missing → impute
+                if not hist_win.empty and use_model:
+                    try:
+                        pred_val = predict_single_missing_value(
+                            historical_window=np.asarray(hist_win.values, dtype=np.float32),
+                            target_sensor_index=col_to_idx[col],
+                            model=model, scaler=scaler, inv_scaler=inv_scaler, device=device
+                        )
+                    except Exception:
+                        pred_val = _last_observed(hist_win, col)
+                else:
+                    pred_val = _last_observed(hist_win, col)
+
+                tsg_running_df.at[ts, col] = pred_val if pd.notna(pred_val) else np.nan
+
+            # else: keep the original value at ts
+
+        # ---- PriSTI: when we have ≥ eval_len steps, impute the last 36 window ----
+        try:
+            end_loc = pristi_running_df.index.get_loc(ts)
+        except KeyError:
+            end_loc = None
+
+        if isinstance(end_loc, int) and (end_loc + 1) >= eval_len:
+            start_loc = end_loc - (eval_len - 1)
+            time_index = pristi_running_df.index[start_loc:end_loc + 1]
+
+            pri_t0 = time.perf_counter()
+            updated_df, info = impute_window_with_pristi(
+                missing_df=pristi_running_df.copy(),
+                sensor_cols=pristi_cols,
+                target_timestamp=ts,
+                model=pristi_model,
+                device=device, eval_len=eval_len, nsample=100
+            )
+            pri_dt = time.perf_counter() - pri_t0
+            if info == "ok":
+                pristi_running_df.loc[time_index, pristi_cols] = updated_df.loc[time_index, pristi_cols].values
+
+            # ---- Build & show comparison figures (ONLY the comparison) ----
+            cols_show = pristi_cols[:cmp_sensors]
+            mask_block = orig_missing_baseline.reindex(index=time_index, columns=pristi_cols).fillna(False)
+
+            tsg_block = tsg_running_df.loc[time_index, pristi_cols].copy()
+            pri_block = pristi_running_df.loc[time_index, pristi_cols].copy()
+
+            # PriSTI display = original values, replaced ONLY on originally-missing cells
+            base_block = orig_values_frozen.loc[time_index, pristi_cols].copy()
+            display_pri = base_block.copy()
+            display_pri[mask_block] = pri_block[mask_block]
+
+            def _window_lines(fig, block, mask_df, cmap):
+                sub_df = block.reset_index()
+                first_col = sub_df.columns[0]
+                if first_col != "datetime":
+                    sub_df = sub_df.rename(columns={first_col: "datetime"})
+                for col in block.columns:
+                    if col not in cols_show: continue
+                    base_color = cmap.get(col, "#444")
+                    xy = (sub_df[["datetime", col]].dropna()
+                          .sort_values("datetime").rename(columns={col: "value"}))
+                    if xy.empty: continue
+                    def is_imp(t):
+                        try: return bool(mask_df.loc[t, col])
+                        except: return False
+                    add_imputed_segments(fig, xy, is_imp, base_color, gap_hours=6)
+                for col in cols_show:
+                    fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
+                                             marker=dict(size=8, color=cmap.get(col, "#444")),
+                                             showlegend=True, name=f"{col}"))
+                fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
+                                         marker=dict(size=8, color="red"),
+                                         showlegend=True, name="Imputed segment"))
+
+            cmap = {c: color_map[c] for c in cols_show}
+            tsg_show  = tsg_block.iloc[-cmp_steps:, :][cols_show]
+            pri_show  = display_pri.iloc[-cmp_steps:, :][cols_show]
+            mask_show = mask_block.iloc[-cmp_steps:, :][cols_show]
+
+            fig_tsg = go.Figure(); _window_lines(fig_tsg, tsg_show, mask_show, cmap)
+            fig_pri = go.Figure(); _window_lines(fig_pri, pri_show, mask_show, cmap)
+            for _f in (fig_tsg, fig_pri):
+                _f.update_layout(title=None, xaxis_title="Time", yaxis_title="Value",
+                                 margin=dict(l=10, r=10, t=20, b=10))
+                lightify(_f)
+
+            ph_times.markdown(
+                f"**Imputation time @ {ts}** — PriSTI: {pri_dt*1000:.1f} ms  •  TSGuard computed per-step."
+            )
+            ph_tsg.plotly_chart(fig_tsg, use_container_width=True, key=f"cmp_tsg_{int(ts.value)}")
+            ph_pri.plotly_chart(fig_pri, use_container_width=True, key=f"cmp_pri_{int(ts.value)}")
+
+            if not first_window_done:
+                first_window_done = True
+                ph_status.success("First 36-step window ready. Comparison is running.", icon="✅")
+
+        else:
+            # still building up the first 36 steps
+            have = (end_loc + 1) if isinstance(end_loc, int) else 0
+            need = max(0, eval_len - have)
+            ph_status.info(f"⏳ Preparing the first window… need {need} more timestamp(s).", icon="⏳")
+
+        # pacing a little so UI updates are visible
+        time.sleep(0.1)
+

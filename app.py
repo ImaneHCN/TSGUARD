@@ -29,7 +29,7 @@ from utils.config import DEFAULT_VALUES
 from models.simulation import (
     run_simulation_with_live_imputation,
     train_model,
-    GCNLSTMImputer,
+    run_tsguard_vs_pristi_comparison
 )
 
 # Plotly default theme
@@ -47,6 +47,52 @@ st.set_page_config(
 # -----------------------------------------------------------------------------
 # Global CSS (professional + your tweaks)
 # -----------------------------------------------------------------------------
+# ---- About TSGuard (Markdown content) ---------------------------------------
+ABOUT_TS_GUARD_MD = """
+### About TSGuard
+
+**TSGuard** is a lightweight, real-time system for detecting and imputing missing values in streaming environmental time series.
+
+**What it does**
+- Monitors large networks of sensors and repairs delayed/missing readings on the fly.
+- Preserves physical plausibility through **domain range constraints** applied to every imputed value.
+- Keeps the interface responsive so operators can see the state of the network as it evolves.
+
+**How it works (under the hood)**
+- **Spatial structure** is captured with a **Graph Neural Network (GNN)** that relates each station to its neighbors.
+- **Temporal continuity** is captured with an **LSTM**, modeling smooth changes over time.
+- The hybrid GNN+LSTM design lets TSGuard impute values for a sensor using both nearby stations **and** recent history.
+- A simple validator enforces **domain-specific bounds** (e.g., acceptable ranges for air-quality metrics) before values are displayed.
+
+**What you’re seeing in the demo**
+- **Live Map (left)**: each station updates in real time — **green = real** reading, **red = imputed** reading at that timestamp.
+- **Gauge (right of map)**: **cumulative percentage of originally-missing data** seen so far on the displayed sensors.
+- **Global Time Series (below)**: full history of the displayed sensors; red segments highlight intervals containing imputed points.
+- **Snapshot (last 10 timestamps)**: a compact, synchronized view of the most recent window for quick trend checks.
+- **Active / Delayed counters**: numbers shown next to the gauge reflect, at the *current timestamp*, how many sensors were observed vs. missing originally.
+
+**Comparison mode (TSGuard vs PriSTI)**
+- PriSTI is a strong baseline model but **heavier to compute**; the comparison page runs it separately.
+- PriSTI can alter some observed values in its internal reconstructions.  
+  In this demo, we show PriSTI **only on cells that were originally missing**, and we keep the **original values** elsewhere — so comparisons are fair.
+- The comparison uses **non-overlapping 36-step windows**; the **first window needs to fill** before plots appear.
+- Sliders let you control how many **sensors** and **timestamps** to display in the side-by-side charts.
+
+**Why it matters**
+- Environmental networks face **delays, outages, and sensor drift**. TSGuard recovers missing values quickly while respecting domain limits.
+- The approach is **online** and **lightweight**, making it suitable for operational dashboards with minimal latency.
+
+**Dataset in the demo**
+- We illustrate the system on **AQI-36**, a network of 36 air-quality stations, to show real-time recovery and plausibility monitoring.
+
+**Notes & limitations**
+- Imputation quality depends on **graph topology**, **window length**, and **data coverage**.
+- Until the first comparison window is ready, the PriSTI panel shows a warm-up message.
+- If a GPU isn’t available, PriSTI may take longer to compute; TSGuard stays responsive.
+
+If you reference this demo, please cite our **TSGuard demo paper**.
+"""
+
 st.markdown("""
 <style>
 /* App background + space for fixed footer */
@@ -184,11 +230,10 @@ def render_header():
           <details class="ts-about">
             <summary title="About TSGuard">❓</summary>
             <div class="about-note">
-              <b>About TSGuard</b><br/>
-              TSGuard is a research prototype for monitoring large sensor networks in real time.
-              It ingests streaming observations, imputes missing values on-the-fly (TSGuard model and PriSTI baseline),
-              and provides a clean visual workspace: a live map, a data-availability gauge, global time series,
-              and configurable comparisons.
+              <b>About TSGuard (quick)</b><br/>
+              Real-time detection and imputation of missing values in streaming environmental data, driven by a hybrid GNN+LSTM model with domain range checks.
+              <br/><br/>
+              <i>Open the “About TSGuard” section below for the full description.</i>
             </div>
           </details>
         </div>
@@ -196,6 +241,11 @@ def render_header():
       </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # Full "About" content right under the header
+    with st.expander("About TSGuard", expanded=False):
+        st.markdown(ABOUT_TS_GUARD_MD)
+
 
 # -----------------------------------------------------------------------------
 # First view (before uploads): header + alert + worldwide demo sensors
@@ -379,6 +429,7 @@ def main():
     # Wrap action buttons so our CSS targets them (#action-bar)
     st.markdown('<div id="action-bar">', unsafe_allow_html=True)
     buttons.add_buttons()
+    # st.write({"page": st.session_state.get("page"), "running": st.session_state.get("running")})
     st.markdown('</div>', unsafe_allow_html=True)
 
     # Init data
@@ -413,37 +464,45 @@ def main():
             st.success(f"✅ Training completed. Model saved to '{model_path}'")
             st.session_state.training = False
 
-    # Simulation
-    if st.session_state.running:
-        st.success("✅ Simulation is running. Click 'Stop Simulation' to end it.")
+    # --- Router (comparison must NOT depend on `running`) ---
+    page = st.session_state.get("page", "sim")
 
-        MODEL_PATH, SCALER_PATH = resolve_paths(
-            model_path="generated/model_TSGuard.pth",
-            scaler_path="generated/model_TSGuard_scaler.json",
+    # Device + scaler (prépare une fois)
+    MODEL_PATH, SCALER_PATH = resolve_paths(
+        model_path="generated/model_TSGuard.pth",
+        scaler_path="generated/model_TSGuard_scaler.json",
+    )
+    if os.path.exists(SCALER_PATH):
+        scaler, inv_scaler = load_scaler_from_json(SCALER_PATH)
+    else:
+        scaler = lambda x: x
+        inv_scaler = lambda x: x
+
+    if page == "cmp":
+        # Page comparaison — indépendante de `running`
+        st.info("📊 Comparison page (TSGuard vs PriSTI).")
+        run_tsguard_vs_pristi_comparison(
+            sim_df=tr, missing_df=df, model=model, scaler=scaler, inv_scaler=inv_scaler, device=device
         )
-        if os.path.exists(SCALER_PATH):
-            scaler, inv_scaler = load_scaler_from_json(SCALER_PATH)
+
+    else:  # page == "sim"
+        if st.session_state.get("running", False):
+            st.success("✅ Simulation is running. Click '📊 TSGuard vs PTISTI' to open the comparison page.")
+            run_simulation_with_live_imputation(
+                sim_df=tr,
+                missing_df=df,
+                positions=pf,
+                model=model,
+                scaler=scaler,
+                inv_scaler=inv_scaler,
+                device=device,
+                graph_placeholder=graph_ph,
+                sliding_chart_placeholder=sliding_ph,
+                gauge_placeholder=gauge_ph,
+                window_hours=24,
+            )
         else:
-            scaler = lambda x: x
-            inv_scaler = lambda x: x
-
-        # if os.path.exists(MODEL_PATH):
-        #     model = GCNLSTMImputer(...).to(device)
-        #     load_state_dict_into(model, MODEL_PATH, device)
-
-        run_simulation_with_live_imputation(
-            sim_df=tr,
-            missing_df=df,
-            positions=pf,
-            model=model,
-            scaler=scaler,
-            inv_scaler=inv_scaler,
-            device=device,
-            graph_placeholder=graph_ph,
-            sliding_chart_placeholder=sliding_ph,
-            gauge_placeholder=gauge_ph,
-            window_hours=24,
-        )
+            st.info("Click '▶️ Start TSGuard Simulation' to begin.")
 
     render_bottom_logos()
 
