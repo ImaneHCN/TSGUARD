@@ -502,7 +502,10 @@ def main():
                 window_hours=24,
             )
         else:
-            st.info("Click '▶️ Start TSGuard Simulation' to begin.")
+            st.info(
+                "Choose an action: 🧠 **Start TSGuard training** to train the model, ▶️ **Start TSGuard Simulation** to start the simulation, or 📊 **TSGuard vs PriSTI** to open the comparison."
+
+            )
 
     render_bottom_logos()
 

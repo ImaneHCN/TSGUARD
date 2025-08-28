@@ -33,6 +33,132 @@ BASE_FONT = dict(
     size=14,
     color="#0F172A",  # dark text
 )
+# ---- Dismissible alerts -----------------------------------------------------
+from typing import Optional
+from uuid import uuid4
+
+
+# ---------- Sticky alerts (top-right) ----------
+import time
+import streamlit as st
+
+def _init_alert_store(max_items:int=20):
+    SS = st.session_state
+    if "_alert_store" not in SS:
+        # chaque entrée: {id, level, text, dedup, ts, dismissed, category, group}
+        SS["_alert_store"] = []
+    if "_alert_seq" not in SS:
+        SS["_alert_seq"] = 0
+    SS["_alert_max"] = max_items
+
+def push_alert(level: str, text: str, dedup_key: str = None,
+               category: str = "general", group: str = "general"):
+    """
+    level ∈ {"success","info","warning","error"}
+    category ∈ {"scenario","constraint","general", ...}
+    group: sous-groupe d'affichage (ex: "Scenario 1" / "Temporal" / "Spatial")
+    """
+    _init_alert_store()
+    store = st.session_state["_alert_store"]
+
+    if dedup_key:
+        for a in store:
+            if (not a.get("dismissed")) and a.get("dedup")==dedup_key and a.get("text")==text:
+                a["ts"] = time.time()   # rafraîchit
+                return
+
+    st.session_state["_alert_seq"] += 1
+    store.append({
+        "id": st.session_state["_alert_seq"],
+        "level": level, "text": text,
+        "dedup": dedup_key, "ts": time.time(),
+        "dismissed": False,
+        "category": category, "group": group
+    })
+
+    # trim (on supprime d'abord les dismissed, sinon le plus ancien)
+    max_items = st.session_state.get("_alert_max", 20)
+    if len(store) > max_items:
+        idx = next((i for i,a in enumerate(store) if a.get("dismissed")), 0)
+        store.pop(idx)
+
+def render_alert_center(max_items: int = 12, *, key_suffix: str = "", placeholder=None):
+    """
+    Rend un stack d'alertes regroupées.
+    - key_suffix: p.ex. "tick_123" pour rendre les keys uniques à chaque tick
+    - placeholder: st.empty() persistant (obligatoire pour réécrire le bloc)
+    """
+    _init_alert_store(max_items)
+    if placeholder is None:
+        placeholder = st.empty()  # fallback
+
+    palette = {"success":"#16a34a","info":"#2563eb","warning":"#f59e0b","error":"#dc2626"}
+    icon    = {"success":"✅","info":"ℹ️","warning":"⚠️","error":"🚨"}
+    severity = {"error":3, "warning":2, "info":1, "success":0}
+
+    # éléments visibles, les plus récents d'abord
+    visible = [a for a in st.session_state["_alert_store"] if not a.get("dismissed")]
+    visible = visible[-max_items:][::-1]
+
+    # ---- regroupement (catégorie, groupe) ----
+    groups = {}  # (cat, grp) -> {"items":[...], "level":worst_level}
+    for a in visible:
+        gk = (a.get("category","general"), a.get("group", a.get("category","general")))
+        if gk not in groups:
+            groups[gk] = {"items": [], "level": a["level"]}
+        groups[gk]["items"].append(a)
+        # niveau = le plus sévère du groupe
+        if severity[a["level"]] > severity[groups[gk]["level"]]:
+            groups[gk]["level"] = a["level"]
+
+    # ---- rendu dans le placeholder ----
+    with placeholder.container():
+        # CSS simple; pas de :has() (plus sûr)
+        st.markdown("""
+        <style>
+          .alert-root { position: fixed; top: 86px; right: 22px; width: 420px; z-index: 99999; }
+          .alert-card{
+            background: #fff; border: 1px solid #e5e7eb; border-left-width: 6px;
+            border-radius: 10px; padding: 10px 12px; margin-bottom: 10px;
+            box-shadow: 0 8px 22px rgba(0,0,0,.10);
+          }
+          .alert-row{ display:flex; align-items:flex-start; gap:10px; }
+          .alert-x button{ border:none; background:transparent; padding:0 4px; font-size:16px; line-height:1; }
+          .alert-title{ font-weight:600; margin-bottom:6px; }
+          .alert-list{ margin:0; padding-left:18px; }
+          .alert-list li{ margin:2px 0; }
+        </style>
+        """, unsafe_allow_html=True)
+
+        # racine fixe (on l'entoure d'un container Streamlit)
+        anchor = st.container()
+        with anchor:
+            st.markdown("<div class='alert-root'>", unsafe_allow_html=True)
+
+            for (cat, grp), data in groups.items():
+                lvl = data["level"]
+                color = palette.get(lvl, "#2563eb")
+                head = f"{icon.get(lvl,'ℹ️')} {cat.capitalize()} — {grp}"
+
+                # bouton ✕ de groupe (ferme toutes les entrées du groupe)
+                cols = st.columns([12,1], gap="small")
+                with cols[0]:
+                    st.markdown(
+                        f"<div class='alert-card' style='border-left-color:{color}'>"
+                        f"<div class='alert-title'>{head}</div>",
+                        unsafe_allow_html=True
+                    )
+                    st.markdown("<ul class='alert-list'>", unsafe_allow_html=True)
+                    for it in data["items"]:
+                        st.markdown(f"<li>{it['text']}</li>", unsafe_allow_html=True)
+                    st.markdown("</ul></div>", unsafe_allow_html=True)
+                with cols[1]:
+                    if st.button("✕", key=f"alert_group_close_{cat}_{grp}_{key_suffix}"):
+                        for it in data["items"]:
+                            it["dismissed"] = True
+                        # pas de rerun ici
+
+            st.markdown("</div>", unsafe_allow_html=True)
 
 def lightify(fig, *, title=None):
     """Make any Plotly fig blend with the light UI."""
@@ -235,7 +361,11 @@ def evaluate_constraints_and_scenarios(
             continue  # scenario classification concerns missing-at-ts only
 
         if streak_h < sigma_hours:
-            alerts.append(("info", f"🕒 Scenario 1 — {sid} @ {ts}: delay below Δt, waiting for late data."))
+            push_alert(
+                "info",
+                f"🕒 Scenario 1 — {sid} @ {ts}: delay below Δt, waiting for late data.",
+                dedup_key=f"s1-{sid}"
+            )
         else:
             # decide 2 vs 3 by neighbor availability
             has_neighbor_present = any(n in present_sids for n in neighbors)
@@ -1284,133 +1414,350 @@ def _window_lines(fig: go.Figure,
                              marker=dict(size=8, color="red"),
                              showlegend=True, name="Imputed segment"))
 
+from collections import defaultdict
+import re
+
+# sévérité pour choisir le pire niveau d'un groupe
+_SEV = {"success":0, "info":1, "warning":2, "error":3}
+
+# =============== Alertes groupées (boîtes fermables) ===============
+import re
+import time
+import pandas as pd
+import streamlit as st
+
+_SEV_ORDER = {"success": 0, "info": 1, "warning": 2, "error": 3}
+
+def _slug(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]+", "", str(s))
+
+
+def add_group_alert(group_title: str, level: str, message: str, ts: pd.Timestamp):
+    """
+    Ajoute une 'note' dans la boîte identifiée par (ts, group_title).
+    'level' met à jour la sévérité de la boîte si plus grave.
+    """
+    _init_group_store()
+    SS = st.session_state
+    ts = pd.Timestamp(ts)
+    gid = f"{ts.isoformat()}|{group_title}"
+    iid = f"{gid}|{hash(message)}"
+    if iid in SS["_grp_seen"]:
+        return
+
+    # chercher ou créer le groupe
+    grp = next((g for g in SS["_grp_alerts"] if g["gid"] == gid), None)
+    if grp is None:
+        grp = {
+            "gid": gid,
+            "title": group_title,
+            "level": level,
+            "ts": ts,
+            "items": [],
+            "dismissed": False,
+        }
+        SS["_grp_alerts"].append(grp)
+
+    # escalade niveau si besoin
+    if _SEV_ORDER.get(level, 1) > _SEV_ORDER.get(grp["level"], 1):
+        grp["level"] = level
+
+    # ajouter l'item
+    grp["items"].append({"iid": iid, "text": message, "dismissed": False})
+    SS["_grp_seen"].add(iid)
+
+    # trimming (garder récentes)
+    max_groups = SS.get("_grp_max", 40)
+    active = [g for g in SS["_grp_alerts"] if not g.get("dismissed")]
+    if len(active) > max_groups:
+        # ferme la plus ancienne
+        oldest_idx = min(range(len(SS["_grp_alerts"])), key=lambda i: SS["_grp_alerts"][i]["ts"])
+        SS["_grp_alerts"][oldest_idx]["dismissed"] = True
+
+import re
+from uuid import uuid4
+
+def _stable_key(seed: str) -> str:
+    # sanitize + add a stable hash suffix so weird chars (|, :, —) are safe
+    base = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(seed))
+    return f"{base}_{abs(hash(seed)) & 0xFFFF_FFFF:X}"
+
+def _init_group_store():
+    SS = st.session_state
+    if "_grp_alerts" not in SS:
+        # dict: gid -> {gid, title, level, ts, items:[{iid,text,dismissed}], dismissed}
+        SS["_grp_alerts"] = {}
+    elif isinstance(SS["_grp_alerts"], list):
+        # MIGRATION from the older list-based store to dict to avoid double-rendering
+        d = {}
+        for g in SS["_grp_alerts"]:
+            gid = g.get("gid") or f"{g.get('ts')}|{g.get('title')}|{g.get('level','info')}"
+            d[gid] = {
+                "gid": gid,
+                "title": g.get("title",""),
+                "level": g.get("level","info"),
+                "ts": pd.Timestamp(g.get("ts")),
+                "items": g.get("items", []),
+                "dismissed": g.get("dismissed", False),
+            }
+        SS["_grp_alerts"] = d
+    if "_grp_ph" not in SS:
+        SS["_grp_ph"] = st.empty()
+    if "_grp_render_seq" not in SS:
+        SS["_grp_render_seq"] = 0
+
+def render_grouped_alerts():
+    _init_group_store()
+    SS = st.session_state
+
+    # bump a per-render sequence to guarantee unique widget keys per run
+    SS["_grp_render_seq"] += 1
+    render_suffix = f"__r{SS['_grp_render_seq']}"
+
+    ph = SS["_grp_ph"]
+    ph.empty()
+
+    st.markdown("""
+    <style>
+      div[data-testid="stVerticalBlock"]:has(> div#grp-alert-anchor){
+        position: fixed; top: 86px; right: 22px; width: 420px; z-index: 99999;
+      }
+      .grp-card{background:#fff;border:1px solid #e5e7eb;border-left-width:6px;
+                border-radius:12px;padding:10px 12px;margin:10px 0;box-shadow:0 8px 22px rgba(0,0,0,.06);}
+      .grp-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;}
+      .grp-title{font-weight:700}
+      .grp-dot{margin-top:4px}
+    </style>
+    <div id="grp-alert-anchor"></div>
+    """, unsafe_allow_html=True)
+
+    palette = {"success":"#16a34a","info":"#2563eb","warning":"#f59e0b","error":"#dc2626"}
+    icon    = {"success":"✅","info":"ℹ️","warning":"⚠️","error":"🚨"}
+
+    groups = [g for g in SS["_grp_alerts"].values() if not g.get("dismissed")]
+    groups.sort(key=lambda g: g["ts"], reverse=True)
+
+    with ph.container():
+        for g in groups:
+            sev = g.get("level", "info")
+            color = palette.get(sev, "#2563eb")
+            gid = str(g["gid"])
+            gid_key = _stable_key(gid)  # sanitized + hashed
+
+            st.markdown(f"<div class='grp-card' style='border-left-color:{color}'>",
+                        unsafe_allow_html=True)
+            h1, h2 = st.columns([12,1], gap="small")
+            with h1:
+                st.markdown(
+                    f"<div class='grp-head'><div class='grp-title'>{icon.get(sev,'ℹ️')} {g['title']}</div>"
+                    f"<div style='opacity:.6;font-size:12px'>{g['ts']}</div></div>",
+                    unsafe_allow_html=True
+                )
+            with h2:
+                if st.button("✕", key=f"grpclose_{gid_key}{render_suffix}"):
+                    g["dismissed"] = True
+
+            live_items = [it for it in g["items"] if not it.get("dismissed")]
+            for idx, it in enumerate(live_items):
+                c1, c2, c3 = st.columns([1,22,1], gap="small")
+                with c1:
+                    st.markdown("<div class='grp-dot'>•</div>", unsafe_allow_html=True)
+                with c2:
+                    st.markdown(it["text"])
+                with c3:
+                    if st.button("✕", key=f"itemclose_{gid_key}_{idx}{render_suffix}"):
+                        it["dismissed"] = True
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+class TickAlertBuffer:
+    """Collecte les lignes puis pousse 1 groupe par (title, level) pour le timestamp ts."""
+    def __init__(self):
+        self.buckets = {}  # key=(title, level) -> list[str]
+
+    def add(self, title: str, level: str, text: str):
+        self.buckets.setdefault((title, level), []).append(text)
+
+    def flush(self, ts):
+        _init_group_store()
+        store = st.session_state["_grp_alerts"]
+        ts = pd.Timestamp(ts)
+        for (title, level), lines in self.buckets.items():
+            # gid unique = ts + title + level  (=> 1 boîte par type à ce tick)
+            gid = f"{ts.isoformat()}|{title}|{level}"
+            g = store.get(gid)
+            if not g:
+                g = {"gid": gid, "title": title, "level": level, "ts": ts,
+                     "items": [], "dismissed": False}
+                store[gid] = g
+            # ajoute les lignes (chacune fermable)
+            for line in lines:
+                g["items"].append({"iid": uuid4().hex, "text": line, "dismissed": False})
+        self.buckets.clear()
+
+
 
 def verify_constraints_and_alerts_for_timestamp(
     ts: pd.Timestamp,
     latlng_df: pd.DataFrame,
     values_by_col: dict,
-    imputed_mask_row: pd.Series | None,      # index = sensor_cols
-    baseline_row: pd.Series,          # index = sensor_cols (manquait à l’origine)
-    missing_streak_hours: dict | None = None,   # {sensor_id: hours_without_value_when_missing}
+    imputed_mask_row: Optional[pd.Series],
+    baseline_row: pd.Series,
+    missing_streak_hours: Optional[dict] = None,
 ):
     import numpy as np
     import streamlit as st
     from utils.config import DEFAULT_VALUES
 
+    buf = TickAlertBuffer()  # <-- NOUVEAU
     constraints = st.session_state.get("constraints", [])
     sigma_minutes = float(st.session_state.get("sigma_threshold", DEFAULT_VALUES.get("sigma_threshold", 30)))
     sigma_hours = max(0.0, sigma_minutes / 60.0)
 
-    # états persistants pour anti-spam
     if "_fault_state" not in st.session_state:
-        # state ∈ {"ok","waiting","fault"}
         st.session_state["_fault_state"] = {}
     fault_state = st.session_state["_fault_state"]
 
-    # placeholder persistant
-    if "_alerts_ph" not in st.session_state:
-        st.session_state["_alerts_ph"] = st.container()
-    alerts = st.session_state["_alerts_ph"]
-
-    # on n’utilise pas les contraintes s’il n’y en a pas ; on garde la logique scenarios
     spatial_rules  = [c for c in constraints if c.get("type") == "Spatial"]
     temporal_rules = [c for c in constraints if c.get("type") == "Temporal"]
 
-    # mapping positions (seulement si on a besoin de spatial)
     if spatial_rules:
-        pos_map = {
-            str(row["data_col"]): (float(row["latitude"]), float(row["longitude"]))
-            for _, row in latlng_df.iterrows()
-            if str(row.get("data_col")) in values_by_col
-        }
+        pos_map = {str(r["data_col"]): (float(r["latitude"]), float(r["longitude"]))
+                   for _, r in latlng_df.iterrows() if str(r.get("data_col")) in values_by_col}
         def haversine_km(lat1, lon1, lat2, lon2):
             from math import radians, sin, cos, sqrt, atan2
-            R = 6371.0
-            dlat = radians(lat2 - lat1); dlon = radians(lon2 - lon1)
-            a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
-            return 2 * R * atan2(sqrt(a), sqrt(1 - a))
-
-    messages = []
+            R=6371.0; dlat=radians(lat2-lat1); dlon=radians(lon2-lon1)
+            a=sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+            return 2*R*atan2(sqrt(a), sqrt(1-a))
 
     for sid, val in values_by_col.items():
         v = None if (val is None or (isinstance(val, float) and np.isnan(val))) else float(val)
         was_missing = bool(baseline_row.get(sid, False))
-        is_imputed  = bool(imputed_mask_row.get(sid, False))
+        is_imputed  = bool(imputed_mask_row.get(sid, False)) if imputed_mask_row is not None else False
         streak_h    = float((missing_streak_hours or {}).get(sid, 0.0))
 
         prev = fault_state.get(sid, "ok")
-        curr = prev  # par défaut
+        curr = prev
 
-        # ---- Scénario 1 vs 3 (sans contraintes)
+        from typing import Optional
+        # remplace les buf.add(...) par ceci :
+        def _emit(level: str, title: str, line: str, ts):
+            # un toast synthétique (titre) + détail sur la 1ère ligne
+            toast_notify(level, f"{title} — {line}", dedup_key=f"{title}|{line}|{ts}")
+
+        # ---- Scénarios ----
         if was_missing and (v is None) and not is_imputed:
-            # pas d’estimation à ce timestamp
             if streak_h < sigma_hours:
-                curr = "waiting"
-                # n’alerter qu’au changement d’état
                 if prev != "waiting":
-                    messages.append(("info", f"⏳ {sid}: waiting for late data @ {ts} (delay below Δt)."))
+                    _emit("info", "Scenario 1 — attente", f"{sid}: Δt non dépassé (streak {streak_h:.1f}h)", ts)
             else:
-                curr = "fault"
                 if prev != "fault":
-                    messages.append(("warning", f"⚠️ {sid}: no reliable estimate @ {ts}. Possible sensor/network fault."))
+                    _emit("warning", "Scenario 3 — indisponible", f"{sid}: aucune estimation fiable @ {ts}", ts)
         else:
-            # valeur disponible (réelle ou imputée)
-            curr = "ok"
             if prev in ("waiting", "fault"):
-                messages.append(("success", f"✅ {sid}: value available again @ {ts}."))
+                _emit("success", "Rétabli", f"{sid}: valeur à nouveau disponible @ {ts}", ts)
 
-        # ---- Contraintes temporelles (optionnel – seulement si définies)
+        # ---- Temporel ----
         if temporal_rules and (v is not None):
-            mo_name = ts.strftime("%B")
+            mo = ts.strftime("%B")
             for rule in temporal_rules:
-                if rule.get("month") != mo_name:
-                    continue
-                opt = rule.get("option")
-                thr = rule.get("temp_threshold", None)
-                try:
-                    thr = float(thr)
-                except Exception:
-                    continue
+                if rule.get("month") != mo: continue
+                opt = rule.get("option"); thr = rule.get("temp_threshold", None)
+                try: thr = float(thr)
+                except: continue
+                title = f"Temporal — {mo} | {opt} {thr:g}"
                 if opt == "Greater than" and not (v > thr):
-                    messages.append(("warning", f"🚨 {sid} @ {ts}: value {v:.2f} ≤ {thr} in {mo_name}."))
+                    _emit("warning", f"Temporal — {mo} (> {thr:g})", f"{sid}: {v:.2f} ≤ {thr:g}", ts)
                 if opt == "Less than" and not (v < thr):
-                    messages.append(("warning", f"🚨 {sid} @ {ts}: value {v:.2f} ≥ {thr} in {mo_name}."))
+                    _emit(
+                        "warning",
+                        f"Temporal — {mo} (< {thr:g})",
+                        f"{sid}: {v:.2f} ≥ {thr:g} @ {ts}",
+                        ts,
+                    )
 
-        # ---- Contraintes spatiales (optionnel – seulement si définies)
+        # ---- Spatial (no duplicates, clean toast) ----
         if spatial_rules and (v is not None) and ('pos_map' in locals()) and (sid in pos_map):
             lat1, lon1 = pos_map[sid]
+
+            # set local pour éviter A–B et B–A au même ts
+            # (on le crée une seule fois par appel de la fonction)
+            emitted_pairs = locals().get("_spatial_emitted_pairs")
+            if emitted_pairs is None:
+                emitted_pairs = set()
+                locals()["_spatial_emitted_pairs"] = emitted_pairs
+
             for rule in spatial_rules:
                 try:
-                    dist_km  = float(rule.get("distance in km", 0))
+                    dist_km = float(rule.get("distance in km", 0))
                     max_diff = float(rule.get("diff", np.inf))
                 except Exception:
                     continue
+                if not np.isfinite(dist_km) or dist_km <= 0 or not np.isfinite(max_diff):
+                    continue
+
+                title = f"Spatial — ≤{dist_km:g} km | maxΔ {max_diff:g}"
+
                 for nid, nval in values_by_col.items():
-                    if nid == sid or nid not in pos_map:
+                    # 1) skip self
+                    if nid == sid:
                         continue
+                    # 2) skip si pas de position
+                    if nid not in pos_map:
+                        continue
+                    # 3) faire chaque paire une seule fois (ordre lexicographique)
+                    a, b = (sid, nid) if sid < nid else (nid, sid)
+                    pair_key = (a, b, dist_km, max_diff, pd.Timestamp(ts))
+                    if pair_key in emitted_pairs:
+                        continue
+
                     nv = None if (nval is None or (isinstance(nval, float) and np.isnan(nval))) else float(nval)
                     if nv is None:
                         continue
+
                     lat2, lon2 = pos_map[nid]
                     d = haversine_km(lat1, lon1, lat2, lon2)
-                    if d <= dist_km and abs(v - nv) > max_diff:
-                        messages.append(("warning",
-                            f"🚨 Spatial: {sid} vs {nid} @ {ts} (d≈{d:.1f} km): |Δ|={abs(v-nv):.2f} > {max_diff}"
-                        ))
+                    if d <= dist_km:
+                        delta = abs(v - nv)
+                        if delta > max_diff:
+                            line = f"{a} vs {b}: |Δ|={delta:.2f} > {max_diff:g} (d≈{d:.1f} km) @ {ts}"
+                            _emit("warning", title, line, ts)
+                            emitted_pairs.add(pair_key)
 
-        # maj état
+        # état persisté (anti-spam)
         fault_state[sid] = curr
 
-    # rendu compact (et anti-spam)
-    with alerts:
-        for lvl, msg in messages:
-            if lvl == "success":
-                st.success(msg)
-            elif lvl == "warning":
-                st.warning(msg)
-            else:
-                st.info(msg)
+    # ⚠️ flush UNE SEULE FOIS, après la boucle
+    buf.flush(ts)
 
+# ========= Toast notifications instead of grouped cards =========
+import time, re
+
+
+_ICON = {"success":"✅","info":"ℹ️","warning":"⚠️","error":"🚨"}
+
+def _init_toast_state():
+    SS = st.session_state
+    if "_toast_seen" not in SS:
+        SS["_toast_seen"] = set()     # anti-dup court terme
+    if "_toast_ttl" not in SS:
+        SS["_toast_ttl"] = 8          # secondes d’affichage / anti-spam
+
+def toast_notify(level: str, text: str, dedup_key: str|None = None):
+    """
+    Envoie une notification toast non bloquante.
+    dedup_key permet d’éviter le spam si on rerend plusieurs fois dans la même seconde.
+    """
+    _init_toast_state()
+    key = f"{level}|{dedup_key or text}"
+    # anti-spam: si déjà toasté très récemment, on ignore
+    if key in st.session_state["_toast_seen"]:
+        return
+    st.session_state["_toast_seen"].add(key)
+
+    # st.toast accepte un "icon" (emoji) + du texte
+    icon = _ICON.get(level, "ℹ️")
+    st.toast(f"{icon} {text}", icon=None)  # icon dans le texte pour garder les couleurs Streamlit
 
 
 def run_simulation_with_live_imputation(
@@ -1439,6 +1786,9 @@ def run_simulation_with_live_imputation(
     import streamlit as st
 
     SS = st.session_state
+    # placeholder persistant pour le centre d'alertes
+    if "_alert_ph" not in SS:
+        SS["_alert_ph"] = st.empty()
 
     # ---------- small helpers ----------
     def init_once(key, val):
@@ -1723,6 +2073,10 @@ def run_simulation_with_live_imputation(
     ptr = int(SS["sim_ptr"])
     total_steps = len(common_index)
 
+
+    # # with st.expander("🔔 Alerts (dismissible)", expanded=True):
+    # render_alert_center(12)
+
     while ptr < total_steps:
         ts = pd.Timestamp(common_index[ptr])
         SS["sim_iter"] += 1
@@ -1816,6 +2170,8 @@ def run_simulation_with_live_imputation(
             imputed_mask_row=imputed_row,
             baseline_row=baseline_row_ts,
         )
+        # à la fin de CHAQUE itération (après la vérif des contraintes et les push_alert)
+        render_grouped_alerts()
 
         # ---- Buffers de rendu (inchangé) ----
         row = {"datetime": ts}
