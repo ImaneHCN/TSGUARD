@@ -21,7 +21,6 @@ import io
 import json
 import sys
 import yaml
-from PriSTI.main_model import PriSTI_aqi36
 from typing import List, Tuple, Optional
 # ---- Plotly: force light theme globally ----
 import plotly.io as pio
@@ -852,7 +851,7 @@ def train_model(
     # ------------- Sauvegarde & retour -------------
     torch.save(model.state_dict(), model_path)
     if use_streamlit:
-        st.success(f"✅ Modèle sauvegardé: `{model_path}` ; Scaler: `{scaler_json}`")
+        st.success(f"✅ Model saved to: `{model_path}` ; Scaler saved to: `{scaler_json}`")
     else:
         print(f"Saved model to {model_path} and scaler to {scaler_json}")
 
