@@ -214,6 +214,59 @@ a:hover{ text-decoration:underline; }
 [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
   padding-top: 60px !important;   /* ajuste la valeur selon la hauteur désirée */
 }
+/* Sidebar structure */
+[data-testid="stSidebar"] > div:first-child {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+/* Logos grid at bottom */
+.sidebar-logos {
+    margin-top: auto;
+    padding: 20px 0;
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 18px;
+    justify-items: center;
+    border-top: 1px solid #ddd;
+}
+
+/* Logo container */
+.sidebar-logos a {
+    position: relative;
+    display: inline-block;
+}
+
+/* Logo image */
+.sidebar-logos img {
+    max-height: 70px;
+    cursor: pointer;
+}
+
+/* Tooltip text */
+.sidebar-logos a::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    bottom: 110%; /* above the logo */
+    left: 50%;
+    transform: translateX(-50%);
+    background: #0B1F33;
+    color: #fff;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s;
+    z-index: 9999;
+}
+
+/* Show tooltip on hover */
+.sidebar-logos a:hover::after {
+    opacity: 1;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -332,36 +385,31 @@ def _img_to_data_uri(path: str) -> str:
         b64 = base64.b64encode(f.read()).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
-def render_bottom_logos():
+def render_sidebar_logos():
     def safe(p):
-        try: return _img_to_data_uri(p)
-        except Exception: return ""
+        try:
+            return _img_to_data_uri(p)
+        except Exception:
+            return ""
+
     ul_b64  = safe(LOGO_UL)
     esi_b64 = safe(LOGO_ESI)
     ch_b64  = safe(LOGO_CH)
     up_b64  = safe(LOGO_UP)
 
-    st.markdown(f"""
-    <div class="ts-footer">
-      <div class="ts-footer-inner">
-        <div class="ts-footer-row">
-          <div class="ts-footer-cell ts-footer-cell--ul">
-            {f'<img src="{ul_b64}" class="ts-footer-img" alt="UL"/>' if ul_b64 else ''}
-          </div>
-          <div class="ts-footer-cell ts-footer-cell--esi">
-            {f'<img src="{esi_b64}" class="ts-footer-img" alt="ESI"/>' if esi_b64 else ''}
-          </div>
-          <div class="ts-footer-cell ts-footer-cell--uhbc">
-            {f'<img src="{ch_b64}" class="ts-footer-img" alt="UHBC"/>' if ch_b64 else ''}
-          </div>
-          <div class="ts-footer-cell ts-footer-cell--up">
-            {f'<img src="{up_b64}" class="ts-footer-img" alt="Université de Paris"/>' if up_b64 else ''}
-          </div>
-        </div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    logos_html = '<div class="sidebar-logos">'
+    if ul_b64:
+        logos_html += f'<a href="https://www.univ-lorraine.fr" target="_blank" data-tooltip="Université de Lorraine"><img src="{ul_b64}" /></a>'
+    if esi_b64:
+        logos_html += f'<a href="https://www.esi.dz" target="_blank" data-tooltip="École Nationale Supérieure d’Informatique (ESI)"><img src="{esi_b64}" /></a>'
+    if ch_b64:
+        logos_html += f'<a href="https://www.univ-chlef.dz" target="_blank" data-tooltip="Université Hassiba Benbouali de Chlef (UHBC)"><img src="{ch_b64}" /></a>'
+    if up_b64:
+        logos_html += f'<a href="https://u-paris.fr" target="_blank" data-tooltip="Université de Paris"><img src="{up_b64}" /></a>'
+    logos_html += "</div>"
 
+    st.sidebar.markdown(logos_html, unsafe_allow_html=True)
+# ----------------------------
 # -----------------------------------------------------------------------------
 # Auto-hide the sidebar once files are ready
 # -----------------------------------------------------------------------------
@@ -415,7 +463,7 @@ def main():
 
     if not files_ready:
         render_first_view()
-        render_bottom_logos()
+        render_sidebar_logos()
         return
 
     # Once ready, hide the sidebar and show the main UI
@@ -507,7 +555,7 @@ def main():
 
             )
 
-    render_bottom_logos()
+    render_sidebar_logos()
 
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
