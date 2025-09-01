@@ -52,7 +52,16 @@ git clone https://github.com/ImaneHCN/TSGuard.git
 cd TSGuard
 ```
 
-### **2️⃣ Create a Virtual Environment**
+### **2️⃣ Initialize and Update Submodules**
+
+TSGUARD uses the [PriSTI](https://github.com/LMZZML/PriSTI) project as a Git submodule.  
+After cloning the repository, run the following command to initialize and fetch all submodules:
+
+```sh
+git submodule update --init --recursive
+```
+
+### ** Create a Virtual Environment**
 #### **Windows:**
 ```sh
 python -m venv venv
