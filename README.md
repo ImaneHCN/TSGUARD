@@ -61,7 +61,7 @@ After cloning the repository, run the following command to initialize and fetch 
 git submodule update --init --recursive
 ```
 
-### ** Create a Virtual Environment**
+### **3️⃣ Create a Virtual Environment**
 #### **Windows:**
 ```sh
 python -m venv venv
@@ -83,7 +83,7 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-### **3️⃣ Install Dependencies**
+### ** Install Dependencies**
 ```sh
 pip install -r requirements.txt
 ```
