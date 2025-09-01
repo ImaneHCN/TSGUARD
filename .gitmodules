@@ -1,0 +1,3 @@
+[submodule "PriSTI"]
+    path = PriSTI
+    url = https://github.com/LMZZML/PriSTI.git
