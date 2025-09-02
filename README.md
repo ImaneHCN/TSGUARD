@@ -113,7 +113,7 @@ Below are some screenshots of the TSGuard interface:
 ![Sensor Graph](docs/screenshots/Imputation.png)
 *Example visualization of sensors & imputation charts.* 
 
-![Comparison vs Pristi](docs/screenshots/Comparison.png)
+![Comparison vs Pristi](docs/screenshots/comparisonsResults.png)
 *Example visualization time-series & imputation charts.* 
 
 ![Missing Values](docs/screenshots/simulation_missing_values_gauge.png)
