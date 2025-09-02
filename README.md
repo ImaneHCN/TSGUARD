@@ -100,20 +100,20 @@ python3 run.py
 ## 📊 Screenshots
 Below are some screenshots of the TSGuard interface:
 
-![Dashboard](docs/screenshots/welcome_dashboard.png)
+![Dashboard](docs/screenshots/Home.png)
 *Main dashboard displaying a sidebar to uplaod training data, sensor data & positions files.*
 
-![Settings](docs/screenshots/settings_contraints.png)
+![Settings](docs/screenshots/Contraints.png)
 *TSGuard configuration including:*
 - **Constraints**: spatial and temporal
 - **Signma Threshold**
 - **Missing Values**: to define the system states.
 - **Graph Size**
 
-![Sensor Graph](docs/screenshots/simulation_sensor_graph.png)
-*Example visualization of sensors.* 
+![Sensor Graph](docs/screenshots/Imputation.png)
+*Example visualization of sensors & imputation charts.* 
 
-![charts](docs/screenshots/simulation_imputation_time_series.png)
+![Comparison vs Pristi](docs/screenshots/Comparison.png)
 *Example visualization time-series & imputation charts.* 
 
 ![Missing Values](docs/screenshots/simulation_missing_values_gauge.png)
