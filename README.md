@@ -119,6 +119,9 @@ Below are some screenshots of the TSGuard interface:
 ![Missing Values](docs/screenshots/simulation_missing_values_gauge.png)
 *Example visualization of system state.* 
 
+## TSGuard vs Pristi
+Based on the evaluation metrics, TSguard significantly outperforms Pristi in both accuracy and error reduction. TSguard achieves a mean absolute error (MAE) of 20.16 and a root mean square error (RMSE) of 31.91, whereas Pristi shows a much higher MAE of 75.23 and RMSE of 111.67. It’s important to note that, for a fair real-time comparison, we disabled Pristi’s ability to use future data points (i.e., longer windows), since the model must operate in an online setting without lookahead. These results demonstrate TSguard’s superior ability to provide precise and reliable imputations in real-time.
+
 ## 🤝 Contributing
 We welcome contributions! Follow these steps:
 1. Fork the repository
