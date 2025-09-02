@@ -34,7 +34,7 @@ TSGuard/
 │   │-- config.py            # Configuration settings
 ├── images/                  # Image assets used in the application
 │-- docs/screenshots/        # Screenshots for documentation
-│-- data/                    # Placeholder for dataset files
+│-- pm25/                    # Placeholder for dataset files
 ```
 
 ## ✅ Prerequisites
@@ -106,21 +106,24 @@ Below are some screenshots of the TSGuard interface:
 ![Settings](docs/screenshots/Constraints.png)
 *TSGuard spatial and temporal constraints
 - The settings also include defining:
-       **Thresholds** of acceptable delay time
-       **Missing Values**: to define the system states.
-       **Graph Size**
+       **Thresholds** of acceptable delay time.  
+       **Missing Values**: to define the system states and the
+       **Graph Size**.
 
 ![Sensor Graph](docs/screenshots/Imputation.png)
 *Example visualization of sensors & imputation charts.* 
 
-![Comparison vs Pristi](docs/screenshots/comparisonsResults.png)
-*Example visualization time-series & imputation charts.* 
+![TSGuard vs Pristi](docs/screenshots/comparisonsResults.png)
+*The comparison interface of Pristi and TSGuard.* 
 
 ![Missing Values](docs/screenshots/simulation_missing_values_gauge.png)
 *Example visualization of system state.* 
 
 ## TSGuard vs Pristi
 Based on the evaluation metrics, TSguard significantly outperforms Pristi in both accuracy and error reduction. TSguard achieves a mean absolute error (MAE) of 20.16 and a root mean square error (RMSE) of 31.91, whereas Pristi shows a much higher MAE of 75.23 and RMSE of 111.67. It’s important to note that, for a fair real-time comparison, we disabled Pristi’s ability to use future data points (i.e., longer windows), since the model must operate in an online setting without lookahead. These results demonstrate TSguard’s superior ability to provide precise and reliable imputations in real-time.
+
+![TSGuard vs Pristi](docs/screenshots/Comparison.png)
+*The results of comparison of TSGuard and Pristi.* 
 
 ## 🤝 Contributing
 We welcome contributions! Follow these steps:
