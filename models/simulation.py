@@ -383,14 +383,17 @@ def evaluate_constraints_and_scenarios(
                         break
 
                 if not own_vios and not any_neigh_vio:
-                    alerts.append(("info", f"✅ Scenario 2.1 — {sid} @ {ts}: imputed within range; neighbors in range."))
+                    # Scenario 2.1
+                    alerts.append(("info", f"✅ {sid} @ {ts}: imputed within range; neighbors in range."))
                 elif own_vios:
-                    alerts.append(("error", f"🚨 Scenario 2.2 — {sid} @ {ts}: imputed value violates constraints ({'; '.join(own_vios)})."))
+                    # Scenario 2.2
+                    alerts.append(("error", f"🚨 {sid} @ {ts}: imputed value violates constraints ({'; '.join(own_vios)})."))
                 elif any_neigh_vio:
-                    alerts.append(("warning", f"⚠️ Scenario 2.3 — {sid} @ {ts}: neighbors out-of-range; possible masked anomaly."))
+                    # Scenario 2.3
+                    alerts.append(("warning", f"⚠️ {sid} @ {ts}: neighbors out-of-range; possible masked anomaly."))
             else:
                 # Scenario 3 — no neighbors
-                alerts.append(("warning", f"🛰️ Scenario 3 — {sid} @ {ts}: neighbors unavailable; fallback to history."))
+                alerts.append(("warning", f"🛰️ {sid} @ {ts}: neighbors unavailable; fallback to history."))
     return alerts
 
 
@@ -1648,10 +1651,12 @@ def verify_constraints_and_alerts_for_timestamp(
         if was_missing and (v is None) and not is_imputed:
             if streak_h < sigma_hours:
                 if prev != "waiting":
-                    _emit("info", "Scenario 1 — attente", f"{sid}: Δt non dépassé (streak {streak_h:.1f}h)", ts)
+                    # Scenario 1
+                    _emit("info", "Attente", f"{sid}: Δt non dépassé (streak {streak_h:.1f}h)", ts)
             else:
                 if prev != "fault":
-                    _emit("warning", "Scenario 3 — indisponible", f"{sid}: aucune estimation fiable @ {ts}", ts)
+                    # Scenario 3:
+                    _emit("warning", "indisponible", f"{sid}: aucune estimation fiable @ {ts}", ts)
         else:
             if prev in ("waiting", "fault"):
                 _emit("success", "Rétabli", f"{sid}: valeur à nouveau disponible @ {ts}", ts)
@@ -1759,105 +1764,229 @@ def toast_notify(level: str, text: str, dedup_key: str|None = None):
     st.toast(f"{icon} {text}", icon=None)  # icon dans le texte pour garder les couleurs Streamlit
 
 
+
+
+from typing import Any, Callable
+
+from typing import Any, Callable
+
+
+from typing import Any, Callable
+
+
+
+from typing import Any, Callable
+
+
+from typing import Any, Callable
+
+from typing import Any, Callable
+
 def run_simulation_with_live_imputation(
     sim_df: pd.DataFrame,
     missing_df: pd.DataFrame,
     positions,
-    model: torch.nn.Module,
+    model: "torch.nn.Module|None",
     scaler: callable,
     inv_scaler: callable,
-    device: torch.device,
+    device: "torch.device|None",
     graph_placeholder,              # unused, kept for signature
     sliding_chart_placeholder,      # unused, kept for signature
     gauge_placeholder,              # unused, kept for signature
     window_hours: int = 24,
+    intro_delay_seconds: float = 1.0,   # 1er tick sans alertes, puis on arme
 ):
     """
-    Drop-in: fixes Fit button (rebuilds deck with new view), places it at top-right of left column,
-    keeps map/gauge/global/snapshot10 + PriSTI/TSGuard comparison with imputation times.
-    Requires helpers & constants already defined elsewhere in your module.
+    • PLOTS: identiques à ta version (draw_full_time_series_with_mask_gap + add_imputed_segments).
+    • NOTIFS: overlay style “Facebook” en HAUT-GAUCHE.
+    • MAP: capteur 'Delayed' en JAUNE (< Δtᵢ), puis ROUGE (≥ Δtᵢ). 'Predicted' = ROUGE.
+    • Δtᵢ = st.session_state['sigma_threshold'] (minutes) → heures.
+    • Scénarios:
+        - S1 (delay < Δtᵢ): on attend → notif info “Awaiting late data”, map JAUNE.
+        - S2 (delay ≥ Δtᵢ + voisins dispo): imputation → contraintes (temporal/spatial) → notif success/erreur.
+        - S3 (delay ≥ Δtᵢ + pas de voisins/estim. fiable): notif erreur “System/Sensor fault?”.
+        - Restauration: notif success “Data restored”.
     """
-    import os, time, uuid
+    import time, uuid, math
     import numpy as np
     import pandas as pd
     import plotly.graph_objects as go
     import pydeck as pdk
     import streamlit as st
+    from streamlit.components.v1 import html as st_html
+
 
     SS = st.session_state
-    # placeholder persistant pour le centre d'alertes
-    if "_alert_ph" not in SS:
-        SS["_alert_ph"] = st.empty()
 
-    # ---------- small helpers ----------
+    ICON_SPEC = SS.setdefault("_icon_spec", {
+        "url": "",
+        "width": 1,
+        "height": 1,
+        "anchorX": 0,
+        "anchorY": 0,
+    })
+
+    # -------------------- Defaults & helpers --------------------
+    DEFAULT_VALUES = globals().get("DEFAULT_VALUES", {
+        "gauge_green_min": 0, "gauge_green_max": 20,
+        "gauge_yellow_min": 20, "gauge_yellow_max": 50,
+        "gauge_red_min": 50, "gauge_red_max": 100,
+        "graph_size": 20, "sigma_threshold": 120,
+    })
+
     def init_once(key, val):
-        if key not in SS:
-            SS[key] = val
+        if key not in SS: SS[key] = val
         return SS[key]
 
-    def zpad6(s: str) -> str:
-        return s if not s.isdigit() else s.zfill(6)
-
+    def zpad6(s: str) -> str: return s if not str(s).isdigit() else str(s).zfill(6)
     def strip0(s: str) -> str:
-        t = s.lstrip("0")
-        return t if t else "0"
+        t = str(s).lstrip("0"); return t if t else "0"
 
-    GREEN = [46, 204, 113, 200]
-    RED   = [231, 76, 60, 200]
+    def positions_to_df_safe(pos):
+        try: return positions_to_df(pos)  # ta version si dispo
+        except Exception: pass
+        if isinstance(pos, pd.DataFrame):
+            cols = {c.lower(): c for c in pos.columns}
+            lat = cols.get("latitude") or cols.get("lat")
+            lon = cols.get("longitude") or cols.get("lon") or cols.get("lng")
+            sid = cols.get("sensor_id") or cols.get("id") or cols.get("name")
+            if not (sid and lat and lon): raise ValueError("positions DF must have sensor_id/latitude/longitude")
+            out = pos.rename(columns={sid:"sensor_id", lat:"latitude", lon:"longitude"}).copy()
+            return out[["sensor_id","latitude","longitude"]]
+        raise ValueError("Unsupported positions type")
 
-    def make_bg_layer(df):
-        return pdk.Layer(
-            "ScatterplotLayer",
-            data=df,
-            get_position=["longitude", "latitude"],
-            get_fill_color="bg_color",
-            get_radius="bg_radius",
-            radius_scale=1,
-            radius_min_pixels=6,
-            radius_max_pixels=22,
-            stroked=True,
-            get_line_color=[255, 255, 255, 180],
-            line_width_min_pixels=1,
-            pickable=False,
-        )
+    def ensure_datetime_column(df: pd.DataFrame, name: str) -> pd.DataFrame:
+        if "datetime" in df.columns: return df
+        if isinstance(df.index, pd.DatetimeIndex):
+            return df.reset_index().rename(columns={"index":"datetime"})
+        for alt in ("timestamp","date","time"):
+            if alt in df.columns: return df.rename(columns={alt:"datetime"})
+        idx_as_dt = pd.to_datetime(df.index, errors="coerce")
+        if idx_as_dt.notna().all():
+            out = df.reset_index().rename(columns={"index":"datetime"})
+            out["datetime"] = idx_as_dt
+            return out
+        raise KeyError(f"{name} has no 'datetime' column or datetime-like index.")
 
-    def make_icon_layer(df):
-        return pdk.Layer(
-            "IconLayer",
-            data=df,
-            get_icon="icon",
-            get_position=["longitude", "latitude"],
-            get_size="icon_size",
-            size_scale=8,
-            size_min_pixels=14,
-            size_max_pixels=28,
-            pickable=True,
-        )
+    def lightify_safe(fig):
+        try: lightify(fig)  # ta skin
+        except Exception: pass
 
-    def fit_view_simple(df: pd.DataFrame, padding_deg=0.02) -> pdk.ViewState:
-        if df is None or df.empty:
-            return pdk.ViewState(latitude=0, longitude=0, zoom=2, bearing=0, pitch=0)
-        lat_min = float(df["latitude"].min());  lat_max = float(df["latitude"].max())
-        lon_min = float(df["longitude"].min()); lon_max = float(df["longitude"].max())
-        lat_c = (lat_min + lat_max) / 2.0
-        lon_c = (lon_min + lon_max) / 2.0
-        span = max(lat_max - lat_min, lon_max - lon_min) + padding_deg
-        span = max(span, 1e-3)
-        zoom = max(1.0, min(16.0, np.log2(360.0 / span)))
-        return pdk.ViewState(latitude=lat_c, longitude=lon_c, zoom=zoom, bearing=0, pitch=0)
+    # -------------------- Notifications “Facebook” (haut-gauche) --------------------
+    SS.setdefault("_notif_items", [])
+    init_once("alerts_armed", False)
 
-    # ---------- select sensors for map/TS/snapshot10 ----------
+    def _render_left_notifs_component():
+        import time as _t
+        now = _t.time()
+        SS["_notif_items"] = [n for n in SS["_notif_items"] if n.get("until", now) > now]
+        icons = {"info":"ℹ️","success":"✅","warning":"⚠️","error":"⛔"}
+        items = []
+        for n in SS["_notif_items"][-10:]:
+            items.append(f"""
+            <div class="tsg-left-notif {n['level']}">
+              <div class="tsg-icon">{icons.get(n['level'],'🔹')}</div>
+              <div class="tsg-body"><div>{n['text']}</div><div class="tsg-ts">{n['ts']}</div></div>
+            </div>""")
+        css = """
+        <style>
+          .tsg-root { position: fixed; top: 12px; left: 12px; width: 320px; z-index: 10000; pointer-events: none; }
+          .tsg-left-notif { background: rgba(33,33,33,.92); color:#fff; border-radius:10px; padding:10px 12px; margin:6px 0;
+                            box-shadow:0 6px 18px rgba(0,0,0,.25); display:flex; gap:8px; align-items:flex-start; }
+          .tsg-left-notif.info    { border-left:4px solid #3498db; }
+          .tsg-left-notif.success { border-left:4px solid #2ecc71; }
+          .tsg-left-notif.warning { border-left:4px solid #f1c40f; }
+          .tsg-left-notif.error   { border-left:4px solid #e74c3c; }
+          .tsg-icon { width:18px; }
+          .tsg-body { flex:1; }
+          .tsg-ts { font-size:11px; opacity:.8; margin-top:2px; }
+          html,body{ background:transparent; margin:0; padding:0; }
+        </style>"""
+        html = f"<!doctype html><html><head>{css}</head><body><div class='tsg-root'>{''.join(items)}</div></body></html>"
+        st_html(html, height=1, scrolling=False)
+
+    class NotificationCenter:
+        def __init__(self): self.seen = SS.setdefault("_notifs_seen", set())
+        def push(self, level, title, text, ts, ttl=6.0, key=None):
+            k = key or f"{level}:{title}:{text}:{str(ts)[:13]}"
+            if k in self.seen: return
+            self.seen.add(k)
+            import time as _t
+            SS["_notif_items"].append({"level":level,"text":f"<b>{title}</b> — {text}",
+                                       "ts": str(ts), "until": _t.time()+float(ttl)})
+            _render_left_notifs_component()
+
+    NOTIF = NotificationCenter()
+    def n_info(ti, tx, ts, key=None): NOTIF.push("info","Awaiting late data" if "Awaiting" in ti else ti, tx, ts, key=key)
+    def n_ok(ti, tx, ts, key=None):   NOTIF.push("success", ti, tx, ts, key=key)
+    def n_warn(ti, tx, ts, key=None): NOTIF.push("warning", ti, tx, ts, key=key)
+    def n_err(ti, tx, ts, key=None):  NOTIF.push("error", ti, tx, ts, key=key)
+
+    # -------------------- Contraintes (spatial/temporal) --------------------
+    constraints_list = SS.get("constraints", []) or []
+    spatial_cfg = None
+    temporal_cfgs = []
+    for c in constraints_list:
+        if c.get("type") == "Spatial": spatial_cfg = c
+        elif c.get("type") == "Temporal": temporal_cfgs.append(c)
+
+    MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"]
+    def month_name(ts: pd.Timestamp) -> str:
+        try: return MONTHS[int(ts.month)-1]
+        except: return ""
+
+    def haversine_km(lat1, lon1, lat2, lon2):
+        R = 6371.0
+        φ1, φ2 = math.radians(lat1), math.radians(lat2)
+        dφ, dλ = math.radians(lat2-lat1), math.radians(lon2-lon1)
+        a = math.sin(dφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(dλ/2)**2
+        return 2*R*math.asin(math.sqrt(a))
+
+    def temporal_ok(ts: pd.Timestamp, val) -> (bool, str|None):
+        if val is None or (isinstance(val,float) and np.isnan(val)): return False, "no value"
+        mname = month_name(ts)
+        rules = [c for c in temporal_cfgs if c.get("month")==mname]
+        if not rules: return True, None
+        v = float(val)
+        for r in rules:
+            opt = (r.get("constraint_option") or r.get("option") or "").lower()
+            thr = float(r.get("temp_threshold", np.nan))
+            if np.isnan(thr): continue
+            if "greater" in opt and not (v > thr): return False, f"{mname}: {v:.2f} !> {thr}"
+            if "less"    in opt and not (v < thr): return False, f"{mname}: {v:.2f} !< {thr}"
+        return True, None
+
+    def spatial_ok(sensor_id: str, ts: pd.Timestamp, val, latlng_df: pd.DataFrame, values_row: dict) -> (bool, list[str]):
+        if spatial_cfg is None or val is None or (isinstance(val,float) and np.isnan(val)): return True, []
+        max_km  = float(spatial_cfg.get("distance in km", 0)) or 0.0
+        max_diff = float(spatial_cfg.get("diff", 0)) if spatial_cfg.get("diff") is not None else 0.0
+        if max_km <= 0 or max_diff <= 0: return True, []
+        row = latlng_df.loc[latlng_df["data_col"] == sensor_id]
+        if row.empty: return True, []
+        lat_s, lon_s = float(row.iloc[0]["latitude"]), float(row.iloc[0]["longitude"])
+        bad = []
+        for _, nb in latlng_df.iterrows():
+            nb_id = nb["data_col"]
+            if nb_id == sensor_id: continue
+            dkm = haversine_km(lat_s, lon_s, float(nb["latitude"]), float(nb["longitude"]))
+            if dkm <= max_km + 1e-9:
+                nb_val = values_row.get(nb_id, np.nan)
+                if nb_val is None or (isinstance(nb_val,float) and np.isnan(nb_val)): continue
+                if abs(float(val)-float(nb_val)) > max_diff:
+                    bad.append(f"{nb_id} (Δ={abs(float(val)-float(nb_val)):.2f} > {max_diff}, {dkm:.2f} km)")
+        return (len(bad)==0), bad
+
+    # -------------------- Sélection / positions --------------------
     all_sensor_cols = [c for c in sim_df.columns if c != "datetime"]
     graph_size = int(SS.get("graph_size", DEFAULT_VALUES["graph_size"]))
     sensor_cols = [str(c) for c in all_sensor_cols[:graph_size]]
     col_to_idx = {c: i for i, c in enumerate(sensor_cols)}
 
-    # ---------- positions ----------
-    latlng_raw = positions_to_df(positions).copy()
+    latlng_raw = positions_to_df_safe(positions).copy()
     latlng_raw["sensor_id"] = latlng_raw["sensor_id"].astype(str).str.strip()
     latlng_raw["latitude"]  = pd.to_numeric(latlng_raw["latitude"],  errors="coerce")
     latlng_raw["longitude"] = pd.to_numeric(latlng_raw["longitude"], errors="coerce")
-    latlng_raw = latlng_raw.dropna(subset=["latitude", "longitude"])
+    latlng_raw = latlng_raw.dropna(subset=["latitude","longitude"]).reset_index(drop=True)
     pos_ids = latlng_raw["sensor_id"].tolist()
 
     map_exact  = {pid: pid for pid in pos_ids if pid in sensor_cols}
@@ -1868,18 +1997,14 @@ def run_simulation_with_live_imputation(
         if s in sensor_cols: map_strip0[pid] = s
         elif s6 in sensor_cols: map_strip0[pid] = s6
     map_index = {}
-    if all(p.isdigit() for p in pos_ids):
+    if all(str(p).isdigit() for p in pos_ids):
         nums = sorted(int(p) for p in pos_ids)
-        if nums and nums[0] == 0 and nums[-1] == len(nums) - 1:
+        if nums and nums[0]==0 and nums[-1]==len(nums)-1:
             for i, pid in enumerate(sorted(pos_ids, key=lambda x: int(x))):
-                if i < len(sensor_cols):
-                    map_index[pid] = sensor_cols[i]
+                if i < len(sensor_cols): map_index[pid] = sensor_cols[i]
 
-    candidates = [map_exact, map_pad6, map_strip0, map_index]
-    best_map = max(candidates, key=lambda m: len(m))
-    if len(best_map) == 0:
-        st.info("No matching positions for selected sensors.")
-        return
+    best_map = max([map_exact, map_pad6, map_strip0, map_index], key=lambda m: len(m))
+    if len(best_map) == 0: st.info("No matching positions for selected sensors."); return
 
     latlng = latlng_raw.copy()
     latlng["data_col"] = latlng["sensor_id"].map(best_map)
@@ -1888,39 +2013,18 @@ def run_simulation_with_live_imputation(
     latlng["__ord"] = latlng["data_col"].map(order_index)
     latlng = latlng.sort_values("__ord").drop(columns="__ord").reset_index(drop=True)
     sensor_cols = [c for c in sensor_cols if c in set(latlng["data_col"])]
-    if not sensor_cols:
-        st.info("After mapping, no sensors remain to plot.")
-        return
+    if not sensor_cols: st.info("After mapping, no sensors remain to plot."); return
     col_to_idx = {c: i for i, c in enumerate(sensor_cols)}
 
-    # ---------- time alignment ----------
-    def ensure_datetime_column(df: pd.DataFrame, name: str) -> pd.DataFrame:
-        if "datetime" in df.columns:
-            return df
-        if isinstance(df.index, pd.DatetimeIndex):
-            return df.reset_index().rename(columns={"index": "datetime"})
-        for alt in ("timestamp", "date", "time"):
-            if alt in df.columns:
-                return df.rename(columns={alt: "datetime"})
-        idx_as_dt = pd.to_datetime(df.index, errors="coerce")
-        if idx_as_dt.notna().all():
-            out = df.reset_index().rename(columns={"index": "datetime"})
-            out["datetime"] = idx_as_dt
-            return out
-        raise KeyError(f"{name} has no 'datetime' column or datetime-like index.")
-
+    # -------------------- Temps / alignement --------------------
     sim_df     = ensure_datetime_column(sim_df, "sim_df")
     missing_df = ensure_datetime_column(missing_df, "missing_df")
-    sim_df["datetime"]     = pd.to_datetime(sim_df["datetime"], errors="coerce")
-    missing_df["datetime"] = pd.to_datetime(missing_df["datetime"], errors="coerce")
-    sim_df     = sim_df.dropna(subset=["datetime"]).copy()
-    missing_df = missing_df.dropna(subset=["datetime"]).copy()
-    sim_df["datetime"]     = sim_df["datetime"].dt.floor("h")
-    missing_df["datetime"] = missing_df["datetime"].dt.floor("h")
+    sim_df["datetime"]     = pd.to_datetime(sim_df["datetime"], errors="coerce").dt.floor("h")
+    missing_df["datetime"] = pd.to_datetime(missing_df["datetime"], errors="coerce").dt.floor("h")
+    sim_df     = sim_df.dropna(subset=["datetime"]).drop_duplicates(subset=["datetime"])
+    missing_df = missing_df.dropna(subset=["datetime"]).drop_duplicates(subset=["datetime"])
     sim_df.set_index("datetime", inplace=True)
     missing_df.set_index("datetime", inplace=True)
-    sim_df     = sim_df[~sim_df.index.duplicated(keep="first")].copy()
-    missing_df = missing_df[~missing_df.index.duplicated(keep="first")].copy()
 
     if "orig_missing_baseline" not in SS:
         SS.orig_missing_baseline = missing_df.isna().copy()
@@ -1928,84 +2032,74 @@ def run_simulation_with_live_imputation(
         if (not SS.orig_missing_baseline.index.equals(missing_df.index) or
             list(SS.orig_missing_baseline.columns) != list(missing_df.columns)):
             SS.orig_missing_baseline = missing_df.isna().copy()
-
-    # >>> ADD (freeze the original values so PriSTI plots can show originals)
     if "orig_missing_values" not in SS:
         SS.orig_missing_values = missing_df.copy()
-    # <<< END ADD
 
-    base_index   = missing_df.index
-    sim_df       = sim_df.reindex(base_index)
-    common_index = base_index
-    if common_index.empty or latlng.empty:
-        st.info("No matching timeline or positions/sensors.")
-        return
+    common_index = missing_df.index
+    if common_index.empty or latlng.empty: st.info("No matching timeline or positions/sensors."); return
 
-    # ---------- persistent state ----------
+    # -------------------- États persistants --------------------
     uid = init_once("sim_uid", f"sim_{uuid.uuid4().hex[:8]}")
     init_once("sim_iter", 0)
-    init_once("sim_ptr", 0)  # position dans la timeline
-    if "imputed_mask" not in SS:
-        SS.imputed_mask = pd.DataFrame(False, index=common_index, columns=sensor_cols, dtype=bool)
-    SS.imputed_mask = SS.imputed_mask.reindex(index=common_index, columns=sensor_cols, fill_value=False)
-
+    init_once("sim_ptr", 0)
     init_once("sliding_window_df", pd.DataFrame(columns=["datetime"] + list(sensor_cols)))
     init_once("global_df", pd.DataFrame(columns=["datetime"] + list(sensor_cols)))
-    init_once("impute_time_tsg", {})  # per-timestamp seconds
-    init_once("impute_time_pri", {})
+    if "_missing_streak_hours" not in SS:
+        SS["_missing_streak_hours"] = {c: 0.0 for c in sensor_cols}
+    else:
+        for c in sensor_cols: SS["_missing_streak_hours"].setdefault(c, 0.0)
+    if "_prev_baseline_missing" not in SS:
+        SS["_prev_baseline_missing"] = {c: None for c in sensor_cols}
 
-
-
-
-    # ---------- UI (created once) ----------
+    # -------------------- UI (identique) --------------------
     if "_ui_inited" not in SS:
         SS["_ui_inited"] = True
-
-        # Row 1: two columns: left (title, time, button, map) | right (gauge)
         col_left, col_right = st.columns([3, 1], gap="small")
-
         with col_left:
             st.markdown("### Sensor Visualization")
             hdr_l, hdr_r = st.columns([5, 2], gap="small")
-            with hdr_l:
-                SS["ph_time"] = st.markdown("**Current Time:** —")
-            with hdr_r:
-                SS["ph_fitbtn"] = st.empty()     # we render the button each run below
-
-            # map placeholder lives in the left column
+            with hdr_l: SS["ph_time"] = st.markdown("**Current Time:** —")
+            with hdr_r: SS["ph_fitbtn"] = st.empty()
             SS["ph_map"] = st.empty()
-
         with col_right:
-            st.markdown(
-                "<div style='text-align:center;font-weight:700;margin:0.25rem 0'>Data Quality & Activity</div>",
-                unsafe_allow_html=True
-            )
+            st.markdown("<div style='text-align:center;font-weight:700;margin:0.25rem 0'>Data Quality & Activity</div>", unsafe_allow_html=True)
             SS["ph_counts_active"]  = st.empty()
             SS["ph_counts_missing"] = st.empty()
             SS["ph_gauge"] = st.empty()
-
         st.markdown("---")
-
-        # Row 2: Global TS (left) + snapshot-10 (right)
         row2_l, row2_r = st.columns([3, 2], gap="small")
-        with row2_l:
-            SS["ph_global"] = st.empty()
-        with row2_r:
-            SS["ph_snap10"] = st.empty()
-
+        with row2_l: SS["ph_global"] = st.empty()
+        with row2_r: SS["ph_snap10"] = st.empty()
         st.markdown("---")
 
-
-    # Render a single Fit button (in left header, aligned right)
     with SS["ph_fitbtn"]:
-        # unique, stable key
         if st.button("Fit map to sensors", use_container_width=True, key=f"{uid}_fitbtn"):
             SS["_fit_event"] = True
 
-    # ---------- deck.gl persistent ----------
-    global ICON_SPEC
-    if "ICON_SPEC" not in globals() or ICON_SPEC is None:
-        ICON_SPEC = {"url": "", "width": 1, "height": 1, "anchorX": 0, "anchorY": 0}
+    # -------------------- deck.gl --------------------
+    GREEN  = [46,204,113,200]; AMBER = [241,196,15,200]; RED = [231,76,60,200]
+    # global ICON_SPEC
+    # if "ICON_SPEC" not in globals() or ICON_SPEC is None:
+    #     ICON_SPEC = {"url": "", "width": 1, "height": 1, "anchorX": 0, "anchorY": 0}
+    def make_bg_layer(df):
+        return pdk.Layer("ScatterplotLayer", data=df,
+                         get_position=["longitude","latitude"],
+                         get_fill_color="bg_color", get_radius="bg_radius",
+                         radius_scale=1, radius_min_pixels=6, radius_max_pixels=22,
+                         stroked=True, get_line_color=[255,255,255,180], line_width_min_pixels=1,
+                         pickable=False)
+    def make_icon_layer(df):
+        return pdk.Layer("IconLayer", data=df, get_icon="icon",
+                         get_position=["longitude","latitude"], get_size="icon_size",
+                         size_scale=8, size_min_pixels=14, size_max_pixels=28, pickable=True)
+    def fit_view_simple(df: pd.DataFrame, padding_deg=0.02) -> pdk.ViewState:
+        if df is None or df.empty: return pdk.ViewState(latitude=0, longitude=0, zoom=2, bearing=0, pitch=0)
+        lat_min = float(df["latitude"].min());  lat_max = float(df["latitude"].max())
+        lon_min = float(df["longitude"].min()); lon_max = float(df["longitude"].max())
+        lat_c = (lat_min+lat_max)/2.0; lon_c = (lon_min+lon_max)/2.0
+        span = max(lat_max-lat_min, lon_max-lon_min) + padding_deg; span = max(span, 1e-3)
+        zoom = max(1.0, min(16.0, np.log2(360.0/span)))
+        return pdk.ViewState(latitude=lat_c, longitude=lon_c, zoom=zoom, bearing=0, pitch=0)
 
     if "deck_obj" not in SS:
         base_df = latlng.copy()
@@ -2014,7 +2108,7 @@ def run_simulation_with_live_imputation(
         base_df["status"] = "Predicted"
         base_df["bg_color"] = [[231, 76, 60, 200] for _ in range(len(base_df))]
         base_df["bg_radius"] = 10
-        base_df["icon"] = [ICON_SPEC] * len(base_df)
+        base_df["icon"] = [ICON_SPEC] * len(base_df)  # ← utilise l'instance stateful
         base_df["icon_size"] = 1.0
 
         init_view = fit_view_simple(base_df)
@@ -2027,65 +2121,62 @@ def run_simulation_with_live_imputation(
         )
         SS["_fit_base_df"] = base_df.copy()
 
-    # Handle Fit event: REBUILD the deck with a NEW view state, then re-render
     if SS.get("_fit_event", False):
         df_to_fit = SS.get("_fit_base_df", latlng)
         new_view = fit_view_simple(df_to_fit)
-        layers = SS.deck_obj.layers
-        # rebuild deck to force refit
-        SS.deck_obj = pdk.Deck(
-            layers=layers,
-            initial_view_state=new_view,
-            map_style=getattr(SS.deck_obj, "map_style", "mapbox://styles/mapbox/light-v11"),
-            tooltip=SS.get("deck_tooltip", {"text": "Sensor {sensor_id}\nValue: {value}\nStatus: {status}"}),
-        )
-        SS["ph_map"].pydeck_chart(SS.deck_obj, use_container_width=True)
+        SS.deck_obj = pdk.Deck(layers=SS.deck_obj.layers, initial_view_state=new_view,
+                               map_style=getattr(SS.deck_obj,"map_style","mapbox://styles/mapbox/light-v11"),
+                               tooltip=SS.get("deck_tooltip", {"text":"Sensor {sensor_id}\nValue: {value}\nStatus: {status}"}))
         SS["_fit_event"] = False
-
-    # Initial map draw (if not drawn by fit)
     SS["ph_map"].pydeck_chart(SS.deck_obj, use_container_width=True)
+    _render_left_notifs_component()
 
-    # ---------- palettes ----------
-    base_palette = ["#000000", "#003366", "#009999", "#006600", "#66CC66",
-                    "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"]
+    # -------------------- Palette PLOTS --------------------
+    base_palette = ["#000000","#003366","#009999","#006600","#66CC66","#FF9933","#FFD700","#708090","#4682B4","#99FF33"]
     sensor_color_map = {c: base_palette[i % len(base_palette)] for i, c in enumerate(sensor_cols)}
 
-
-    # add a place to show alerts (non-intrusive)
-    if "ph_alerts" not in SS:
-        SS["ph_alerts"] = st.empty()
-
-    # missing-streak tracker (by data_col) for scenario 1 thresholding
-    if "_missing_streak_hours" not in SS:
-        SS["_missing_streak_hours"] = {c: 0 for c in sensor_cols}
-    else:
-        # keep in sync with current selection
-        for c in sensor_cols:
-            SS["_missing_streak_hours"].setdefault(c, 0)
-
-    # ---------- main loop (resume from pointer) ----------
+    # -------------------- Modèle --------------------
     use_model = model is not None
     if use_model:
-        model.eval()
+        try: model.eval()
+        except Exception: pass
 
+    # -------------------- Δtᵢ --------------------
+    sigma_minutes = SS.get("sigma_threshold", DEFAULT_VALUES["sigma_threshold"])
+    DELTA_HOURS = float(sigma_minutes) / 60.0
+
+    # -------------------- Mask builder (pour PLOTS) --------------------
+    def build_imputed_mask_from_store(missing_df: pd.DataFrame,
+                                      baseline_missing: pd.DataFrame,
+                                      sensor_cols: list[str]) -> pd.DataFrame:
+        base = baseline_missing.reindex(index=missing_df.index, columns=sensor_cols, fill_value=False).astype(bool)
+        now_has_val = missing_df.reindex(columns=sensor_cols).notna()
+        return (base & now_has_val).astype(bool)
+
+    # -------------------- Fallback prédicteur --------------------
+    def predict_single_missing_value_fallback(historical_window, target_sensor_index, **kwargs):
+        try:
+            col = int(target_sensor_index)
+            col_series = pd.Series(historical_window[:, col])
+            col_series = pd.to_numeric(col_series, errors="coerce").dropna()
+            return float(col_series.iloc[-1]) if not col_series.empty else np.nan
+        except Exception:
+            return np.nan
+
+    # -------------------- LOOP --------------------
     SNAP10 = 10
     ptr = int(SS["sim_ptr"])
     total_steps = len(common_index)
 
-
-    # # with st.expander("🔔 Alerts (dismissible)", expanded=True):
-    # render_alert_center(12)
-
     while ptr < total_steps:
         ts = pd.Timestamp(common_index[ptr])
-        SS["sim_iter"] += 1
+        SS["sim_iter"] = SS.get("sim_iter", 0) + 1
         iter_key = SS["sim_iter"]
-        baseline_row_ts = SS.orig_missing_baseline.reindex(index=[ts], columns=sensor_cols).iloc[0]
-
-        # time label
         SS["ph_time"].markdown(f"<div style='font-weight:600'>Current Time: {ts}</div>", unsafe_allow_html=True)
 
-        # history window strictly before ts
+        baseline_row_ts = SS.orig_missing_baseline.reindex(index=[ts], columns=sensor_cols).iloc[0]
+
+        # Fenêtre historique < ts
         hist_end = ts - pd.Timedelta(hours=1)
         if hist_end in missing_df.index:
             hist_idx = missing_df.loc[:hist_end].index[-window_hours:]
@@ -2093,22 +2184,30 @@ def run_simulation_with_live_imputation(
             hist_idx = missing_df.index[missing_df.index < ts][-window_hours:]
         hist_win = missing_df.loc[hist_idx, sensor_cols] if len(hist_idx) > 0 else pd.DataFrame()
 
-        # --- TSGuard imputation (alignée baseline) ---
-        tsg_start = time.perf_counter()
-        baseline_row_ts = SS.orig_missing_baseline.reindex(index=[ts], columns=sensor_cols).iloc[0]
-
-        svals, sstatus = [], []
-
+        # --- Imputation avec attente Δtᵢ ---
+        svals, status = [], []  # status: "Real" | "Delayed" | "Predicted"
         for col in sensor_cols:
-            is_missing_now = bool(baseline_row_ts.get(col, False))
+            originally_missing = bool(baseline_row_ts.get(col, False))
+            val_now = np.nan
 
-            if is_missing_now:
-                pred_val = np.nan
+            if originally_missing:
+                # streak / délai
+                SS["_missing_streak_hours"][col] = SS["_missing_streak_hours"].get(col, 0.0) + 1.0
+                delay_h = SS["_missing_streak_hours"][col]
 
-                if not hist_win.empty:
-                    if use_model:
+                if delay_h < DELTA_HOURS:
+                    # S1: attendre (ne pas imputer)
+                    status.append("Delayed")
+                    svals.append(np.nan)
+                    if SS.get("alerts_armed", False):
+                        n_info("Awaiting late data", f"Sensor {col}: missing for {int(delay_h)}h (Δt={DELTA_HOURS:.1f}h).", ts,
+                              key=f"s1:{col}:{int(delay_h)}")
+                else:
+                    # S2/S3: tenter d’imputer
+                    pred_val = np.nan
+                    if use_model and not hist_win.empty:
                         try:
-                            pred_val = predict_single_missing_value(
+                            pred_val = predict_single_missing_value(   # ta fonction si dispo
                                 historical_window=np.asarray(hist_win.values, dtype=np.float32),
                                 target_sensor_index=col_to_idx[col],
                                 model=model, scaler=scaler, inv_scaler=inv_scaler, device=device
@@ -2116,167 +2215,154 @@ def run_simulation_with_live_imputation(
                         except Exception:
                             pred_val = np.nan
                     if (not np.isfinite(pred_val)) or pd.isna(pred_val):
-                        # fallback: dernier réel dans l'historique
-                        last = pd.to_numeric(hist_win[col].dropna(), errors="coerce")
-                        pred_val = float(last.iloc[-1]) if len(last) else np.nan
+                        pred_val = predict_single_missing_value_fallback(
+                            historical_window=np.asarray(hist_win.values, dtype=np.float32) if not hist_win.empty else np.empty((0, len(sensor_cols))),
+                            target_sensor_index=col_to_idx[col]
+                        )
 
-                # write + flags
+                    if np.isfinite(pred_val) and not pd.isna(pred_val):
+                        try: missing_df.at[ts, col] = float(pred_val)
+                        except Exception: pass
+                        status.append("Predicted")
+                        svals.append(float(pred_val))
+
+                        # Contraintes
+                        ok_t, msg_t = temporal_ok(ts, pred_val)
+                        # Prépare la ligne des voisins au même ts
+                        row_vals = {c: (missing_df.at[ts, c] if (ts in missing_df.index and c in missing_df.columns) else np.nan) for c in sensor_cols}
+                        row_vals[col] = pred_val
+                        ok_s, bad_neighbors = spatial_ok(col, ts, pred_val, latlng, row_vals)
+
+                        if SS.get("alerts_armed", False):
+                            if (not ok_t) and msg_t:
+                                n_err("Real-time alert", f"Sensor {col}: temporal constraint failed — {msg_t}.", ts)
+                            elif (not ok_s) and bad_neighbors:
+                                n_err("Real-time alert", f"Sensor {col}: spatial inconsistency → {', '.join(bad_neighbors[:5])}{'…' if len(bad_neighbors)>5 else ''}.", ts)
+                            else:
+                                n_ok("Imputation completed", f"Sensor {col}: reconstructed; plausibility OK.", ts)
+                    else:
+                        # S3: aucune estimation fiable
+                        status.append("Delayed")
+                        svals.append(np.nan)
+                        if SS.get("alerts_armed", False):
+                            n_err("System/Sensor fault?", f"Sensor {col}: no reliable estimate from historical patterns.", ts)
+            else:
+                # Donnée réelle présente à l'origine
+                SS["_missing_streak_hours"][col] = 0.0
                 try:
-                    missing_df.at[ts, col] = pred_val if pd.notna(pred_val) else np.nan
+                    val_now = missing_df.at[ts, col]
                 except Exception:
-                    pass
-                svals.append(pred_val)
-                sstatus.append(False)                     # imputé (rouge sur la map)
-                SS.imputed_mask.at[ts, col] = pd.notna(pred_val)
+                    val_now = np.nan
+                svals.append(val_now)
+                status.append("Real")
 
-            else:
-                # présent à l'origine → garder la valeur
-                v = missing_df.at[ts, col] if (ts in missing_df.index and col in missing_df.columns) else np.nan
-                svals.append(v)
-                sstatus.append(True)                      # réel (vert sur la map)
-                SS.imputed_mask.at[ts, col] = False
+                # Restauration si précédemment “missing”
+                prev = SS["_prev_baseline_missing"].get(col, None)
+                if SS.get("alerts_armed", False) and prev is True:
+                    n_ok("Data restored", f"Sensor {col}: telemetry available at {ts}.", ts)
 
-        SS["impute_time_tsg"][ts] = time.perf_counter() - tsg_start
+            SS["_prev_baseline_missing"][col] = originally_missing
 
-        # Sécurité : parité des tailles
-        if len(svals)   < len(sensor_cols): svals   += [np.nan] * (len(sensor_cols) - len(svals))
-        if len(sstatus) < len(sensor_cols): sstatus += [False]  * (len(sensor_cols) - len(sstatus))
-
-        # ---- Dicts capteur -> valeur/état ----
-        vals_by_col = dict(zip(sensor_cols, svals))
-        real_by_col = dict(zip(sensor_cols, sstatus))
-        imputed_row = SS.imputed_mask.reindex(index=[ts], columns=sensor_cols, fill_value=False).iloc[0]
-
-        # --- Update missing streak (Scénario 1) ---
-        if "_missing_streak_hours" not in SS:
-            SS["_missing_streak_hours"] = {c: 0.0 for c in sensor_cols}
-
-        for c in sensor_cols:
-            originally_missing = bool(baseline_row_ts.get(c, False))
-            val_now = vals_by_col.get(c, np.nan)
-            no_value_now = (val_now is None) or (isinstance(val_now, float) and np.isnan(val_now))
-            # On incrémente uniquement quand il manquait à l’origine ET qu’on n’a toujours pas de valeur à afficher
-            if originally_missing and no_value_now:
-                SS["_missing_streak_hours"][c] = SS["_missing_streak_hours"].get(c, 0.0) + 1.0  # +1h par tick
-            else:
-                SS["_missing_streak_hours"][c] = 0.0
-
-        # ---- Vérification des contraintes & alertes (appelle TA fonction) ----
-        verify_constraints_and_alerts_for_timestamp(
-            ts=ts,
-            latlng_df=latlng[["sensor_id", "data_col", "latitude", "longitude"]],
-            values_by_col=vals_by_col,
-            imputed_mask_row=imputed_row,
-            baseline_row=baseline_row_ts,
-        )
-        # à la fin de CHAQUE itération (après la vérif des contraintes et les push_alert)
-        render_grouped_alerts()
-
-        # ---- Buffers de rendu (inchangé) ----
+        # --- Buffers rendu (sliding & global) ---
         row = {"datetime": ts}
-        for i, c in enumerate(sensor_cols):
-            row[c] = svals[i]
+        for i, c in enumerate(sensor_cols): row[c] = svals[i]
         SS.sliding_window_df.loc[len(SS.sliding_window_df)] = row
         SS.global_df.loc[len(SS.global_df)] = row
-        if len(SS.sliding_window_df) > 36:
-            SS.sliding_window_df = SS.sliding_window_df.tail(36)
+        if len(SS.sliding_window_df) > 36: SS.sliding_window_df = SS.sliding_window_df.tail(36)
 
-
-        # --- Map update & store base for next Fit ---
-        # --- juste avant la mise à jour de la carte ---
-        # (garde les mêmes noms de variables que ton code)
-        if len(svals) != len(sensor_cols) or len(sstatus) != len(sensor_cols):
-            if not st.session_state.get("_warned_len_mismatch", False):
-                st.warning(
-                    f"[Guard] Mismatch tailles — sensors={len(sensor_cols)}, svals={len(svals)}, sstatus={len(sstatus)}. "
-                    "On complète seulement ce tick."
-                )
-                st.session_state["_warned_len_mismatch"] = True
-
-        # mapping sûr (pas d'IndexError); les capteurs sans valeur recevront NaN/False et la map affichera 'NA'
-        vals_by_col = dict(zip(sensor_cols, svals))
-        real_by_col = dict(zip(sensor_cols, sstatus))
+        # --- Carte (JAUNE < Δtᵢ, ROUGE ≥ Δtᵢ ou Predicted) ---
         tick_df = latlng.copy()
-        tick_df["value"]  = tick_df["data_col"].map(vals_by_col).fillna("NA")
-        tick_df["status"] = tick_df["data_col"].map(lambda c: "Real" if real_by_col.get(c, False) else "Predicted")
-        tick_df["bg_color"] = [GREEN if s == "Real" else RED for s in tick_df["status"]]
+        vals_by_col = dict(zip(sensor_cols, svals))
+        status_by_col = dict(zip(sensor_cols, status))
+        def color_for(col):
+            stt = status_by_col.get(col, "Real")
+            if stt == "Real": return [46,204,113,200]           # vert
+            if stt == "Predicted": return [231,76,60,200]       # rouge
+            # Delayed: jaune si < Δtᵢ, rouge si >= Δtᵢ
+            delay_h = SS["_missing_streak_hours"].get(col, 0.0)
+            return [241,196,15,200] if delay_h < DELTA_HOURS else [231,76,60,200]
+
+        tick_df["value"] = tick_df["data_col"].map(vals_by_col).fillna("NA")
+        tick_df["status"] = tick_df["data_col"].map(lambda c: status_by_col.get(c, "Real"))
+        tick_df["bg_color"] = tick_df["data_col"].map(color_for)
         tick_df["bg_radius"] = 10
-        tick_df["icon"] = [ICON_SPEC] * len(tick_df)
+
+        tick_df["icon"] = [ICON_SPEC] * len(tick_df)  # ← pas de global
         tick_df["icon_size"] = 1.0
-        SS.deck_obj.layers = [make_bg_layer(tick_df), make_icon_layer(tick_df)]
+
+        # fit éventuel
+        if SS.get("_fit_event", False):
+            new_view = fit_view_simple(tick_df)
+            SS.deck_obj = pdk.Deck(layers=[make_bg_layer(tick_df), make_icon_layer(tick_df)],
+                                   initial_view_state=new_view,
+                                   map_style="mapbox://styles/mapbox/light-v11",
+                                   tooltip=SS.get("deck_tooltip", {"text":"Sensor {sensor_id}\nValue: {value}\nStatus: {status}"}))
+            SS["_fit_event"] = False
+        else:
+            SS.deck_obj.layers = [make_bg_layer(tick_df), make_icon_layer(tick_df)]
         SS["_fit_base_df"] = tick_df.copy()
         SS["ph_map"].pydeck_chart(SS.deck_obj, use_container_width=True)
+        _render_left_notifs_component()  # garde l’overlay vivant
 
-        # --- Gauge & counts (CUMULATIVE MISSED from the beginning to now) ---
+        # --- Gauge & compteurs ---
         baseline_mask_to_now = SS.orig_missing_baseline.loc[:ts, sensor_cols]
-        cumulative_missed = int(baseline_mask_to_now.values.sum())  # total # of originally-missing cells up to ts
+        cumulative_missed = int(baseline_mask_to_now.values.sum())
         total_cells_to_now = baseline_mask_to_now.size
         pct_missed_to_now = (cumulative_missed / total_cells_to_now * 100.0) if total_cells_to_now else 0.0
-
-        # Active sensors NOW (same as before, just for info)
-        row_imp = SS.imputed_mask.reindex(index=[ts], columns=sensor_cols, fill_value=False).iloc[0]
-        imputed_now = int(row_imp.sum())
-        sensors_total = max(1, len(sensor_cols))
-        real_now = sensors_total - imputed_now
-
-        # Per-timestamp (NOW) counts that match the map colors:
         missed_now = int(baseline_row_ts.sum())
         active_now = len(sensor_cols) - missed_now
-
         SS["ph_counts_active"].markdown(f"Active sensors now: **{active_now}**")
         SS["ph_counts_missing"].markdown(f"Delayed sensors now: **{missed_now}**")
 
-        # Gauge shows MISSED DATA (%) cumulatively
         gauge_fig = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=pct_missed_to_now,
-            title={"text": "Missed Data (%)"},
-            gauge={
-                "axis": {"range": [0, 100]},
-                "bar": {"color": "red" if pct_missed_to_now >= DEFAULT_VALUES["gauge_red_max"] else "green"},
-                "steps": [
-                    {"range": [DEFAULT_VALUES["gauge_green_min"], DEFAULT_VALUES["gauge_green_max"]],
-                     "color": "lightgreen"},
-                    {"range": [DEFAULT_VALUES["gauge_yellow_min"], DEFAULT_VALUES["gauge_yellow_max"]],
-                     "color": "yellow"},
-                    {"range": [DEFAULT_VALUES["gauge_red_min"], DEFAULT_VALUES["gauge_red_max"]], "color": "red"},
-                ],
-            },
-        ))
-        gauge_fig.update_layout(title="",margin=dict(l=10, r=10, t=30, b=10))
-        lightify(gauge_fig)
+            mode="gauge+number", value=pct_missed_to_now, title={"text":"Missed Data (%)"},
+            gauge={"axis":{"range":[0,100]},
+                   "bar":{"color":"red" if pct_missed_to_now >= DEFAULT_VALUES["gauge_red_max"] else "green"},
+                   "steps":[
+                       {"range":[DEFAULT_VALUES["gauge_green_min"],DEFAULT_VALUES["gauge_green_max"]], "color":"lightgreen"},
+                       {"range":[DEFAULT_VALUES["gauge_yellow_min"],DEFAULT_VALUES["gauge_yellow_max"]], "color":"yellow"},
+                       {"range":[DEFAULT_VALUES["gauge_red_min"],DEFAULT_VALUES["gauge_red_max"]], "color":"red"}]}))
+        gauge_fig.update_layout(title="", margin=dict(l=10,r=10,t=30,b=10))
+        lightify_safe(gauge_fig)
         SS["ph_gauge"].plotly_chart(gauge_fig, use_container_width=True, key=f"{uid}_gauge_{iter_key}")
 
-        # --- Global TS ---
-        full_ts_fig = draw_full_time_series_with_mask_gap(SS.global_df.copy(), SS.imputed_mask, sensor_cols, sensor_color_map)
-        lightify(full_ts_fig)
+        # --- PLOTS (même logique que chez toi) ---
+        # masque reconstruit depuis la mémoire → segments rouges cohérents
+        mask_plot = build_imputed_mask_from_store(missing_df, SS.orig_missing_baseline, sensor_cols)
+
+        # Global TS
+        # (reindex pour coller à l’ordre temporel de global_df)
+        mask_for_global = mask_plot.reindex(index=pd.to_datetime(SS.global_df["datetime"]), columns=sensor_cols, fill_value=False)
+        full_ts_fig = draw_full_time_series_with_mask_gap(SS.global_df.copy(), mask_for_global, sensor_cols, sensor_color_map)
+        lightify_safe(full_ts_fig)
         SS["ph_global"].plotly_chart(full_ts_fig, use_container_width=True, key=f"{uid}_global_{iter_key}")
 
-        # --- Snapshot 10 (no legend) ---
+        # Snapshot 10
         snap10 = SS.sliding_window_df.tail(SNAP10)
         snap10_fig = go.Figure()
         for col in sensor_cols:
             base_color = sensor_color_map[col]
-            sub = (snap10[["datetime", col]].dropna()
-                   .sort_values("datetime").rename(columns={col: "value"}))
-            if sub.empty:
-                continue
+            sub = (snap10[["datetime", col]].dropna().sort_values("datetime").rename(columns={col:"value"}))
+            if sub.empty: continue
             def is_imp(t, c=col):
-                try: return bool(SS.imputed_mask.loc[t, c])
+                try: return bool(mask_plot.loc[pd.Timestamp(t), c])
                 except: return False
             add_imputed_segments(snap10_fig, sub, is_imp, base_color, gap_hours=6)
         snap10_fig.update_layout(title="Snapshot (last 10)",
                                  xaxis_title="Time", yaxis_title="Value",
-                                 margin=dict(l=20, r=20, t=40, b=20),
-                                 showlegend=False)
-        lightify(snap10_fig)
-
+                                 margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
+        lightify_safe(snap10_fig)
         SS["ph_snap10"].plotly_chart(snap10_fig, use_container_width=True, key=f"{uid}_snap10_{iter_key}")
 
-        # advance pointer
+        # --- avance + armement alertes ---
         ptr += 1
         SS["sim_ptr"] = ptr
-        time.sleep(1)
+        if not SS.get("alerts_armed", False):
+            time.sleep(float(intro_delay_seconds))
+            SS["alerts_armed"] = True
+        else:
+            time.sleep(1.0)
+
 
 def run_tsguard_vs_pristi_comparison(
     sim_df: pd.DataFrame,
@@ -2288,134 +2374,318 @@ def run_tsguard_vs_pristi_comparison(
     eval_len: int = 36,
     window_hours: int = 24,
 ):
-    import time
+    import os, time, hashlib
     import numpy as np
     import pandas as pd
     import plotly.graph_objects as go
     import streamlit as st
-    from utils.config import DEFAULT_VALUES
+
+    # ---------------- helpers ----------------
+    try:
+        from utils.config import DEFAULT_VALUES
+    except Exception:
+        DEFAULT_VALUES = {"graph_size": 36}
+
     def _last_observed(hist_df: pd.DataFrame, col: str) -> float:
-        if hist_df.empty or col not in hist_df.columns:
-            return np.nan
+        if hist_df.empty or col not in hist_df.columns: return np.nan
         s = pd.to_numeric(hist_df[col].dropna(), errors="coerce")
         return float(s.iloc[-1]) if len(s) else np.nan
 
-    SS = st.session_state
-    print("Running TSGuard vs PTISTI")
-
-    # --- Header & notices ---
-    st.markdown("## TSGuard vs PriSTI — Comparison")
-    st.warning("⚠️ The comparison can be long because PriSTI computation is heavy.", icon="⚠️")
-    ph_status = st.info("⏳ Preparing the first window…", icon="⏳")
-
-    # ---------- Align time & columns (same as your sim) ----------
-    def ensure_datetime(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    def ensure_datetime(df: pd.DataFrame) -> pd.DataFrame:
+        """Conserver date+heure exactes (aucun arrondi/‘floor’)."""
         if "datetime" in df.columns:
-            df = df.copy(); df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+            df = df.copy()
+            df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
             df = df.dropna(subset=["datetime"]).set_index("datetime")
         else:
             if not isinstance(df.index, pd.DatetimeIndex):
-                df = df.copy(); df.index = pd.to_datetime(df.index, errors="coerce")
+                df = df.copy()
+                df.index = pd.to_datetime(df.index, errors="coerce")
                 df = df[~df.index.isna()]
-        df.index = df.index.floor("h")
-        df = df[~df.index.duplicated(keep="first")].sort_index()
-        return df
-
-    sim_df     = ensure_datetime(sim_df, "sim_df")
-    missing_df = ensure_datetime(missing_df, "missing_df")
+        if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+            df.index = df.index.tz_convert("UTC").tz_localize(None)
+        return df[~df.index.duplicated(keep="first")].sort_index()
 
     def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
         out.columns = [(str(c).strip().zfill(6) if str(c).isdigit() else str(c).strip()) for c in out.columns]
         return out
 
-    sim_df = _norm_cols(sim_df)
-    missing_df = _norm_cols(missing_df)
+    def lightify(fig: go.Figure) -> None:
+        fig.update_layout(template="plotly_white",
+                          legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                          margin=dict(l=10, r=10, t=28, b=10))
+        fig.update_xaxes(showgrid=True, gridwidth=1, griddash="dot", type="date", tickformat="%Y-%m-%d %H:%M")
+        fig.update_yaxes(showgrid=True, gridwidth=1, griddash="dot")
 
-    # columns like your sim (keep order)
-    all_sensor_cols = [c for c in sim_df.columns if c != "datetime"]
-    graph_size = int(SS.get("graph_size", DEFAULT_VALUES["graph_size"]))
-    sensor_cols = [str(c) for c in all_sensor_cols[:graph_size]]
+    def add_segmented_curve(fig, xs, ys, imp_flags, base_color: str, gap_hours: float = 6.0):
+        """xs: list[datetime], ys: array, imp_flags: array[bool] → rouge=True pour segments"""
+        if len(xs) < 2:
+            return
+        seg_x = [xs[0]]; seg_y = [ys[0]]; seg_imp = bool(imp_flags[0])
+        for i in range(1, len(xs)):
+            gap = (xs[i] - xs[i-1]).total_seconds() / 3600.0
+            flipped = (bool(imp_flags[i]) != seg_imp)
+            if (gap > gap_hours) or flipped:
+                if len(seg_x) >= 2:
+                    fig.add_trace(dict(
+                        type="scatter", mode="lines",
+                        x=list(seg_x), y=list(seg_y),
+                        line=dict(width=2, color=("red" if seg_imp else base_color)),
+                        showlegend=False
+                    ))
+                seg_x, seg_y = [xs[i-1], xs[i]], [ys[i-1], ys[i]]
+                seg_imp = bool(imp_flags[i])
+            else:
+                seg_x.append(xs[i]); seg_y.append(ys[i])
+        if len(seg_x) >= 2:
+            fig.add_trace(dict(
+                type="scatter", mode="lines",
+                x=list(seg_x), y=list(seg_y),
+                line=dict(width=2, color=("red" if seg_imp else base_color)),
+                showlegend=False
+            ))
 
-    # baseline: originally missing
-    orig_missing_baseline = missing_df.isna().copy()
-    # keep ORIGINAL values for PriSTI display
-    orig_values_frozen = missing_df.copy()
+    # signature **stable** de la timeline (indépendante des valeurs / régularisation)
+    def timeline_signature(idx: pd.DatetimeIndex, cols: list) -> str:
+        h = hashlib.md5()
+        # index -> int64 ns (asi8), ordre conservé
+        try:
+            h.update(np.asarray(idx.asi8).tobytes())
+        except Exception:
+            h.update("|".join(map(str, idx.astype("datetime64[ns]"))).encode())
+        h.update(("|".join(map(str, cols))).encode())
+        return h.hexdigest()
 
-    # reindex both on common timeline
-    common_index = missing_df.index
-    sim_df = sim_df.reindex(common_index)
-    if common_index.empty:
+    # ---------------- normalisation ----------------
+    st.markdown("## TSGuard vs PriSTI — Comparison")
+    SS = st.session_state
+
+    sim_df     = _norm_cols(ensure_datetime(sim_df))
+    missing_df = _norm_cols(ensure_datetime(missing_df))
+    if missing_df.index.empty:
         st.info("No timeline to compare."); return
 
-    # PriSTI artifacts (as in your helpers)
+    # ---------------- PriSTI presence ----------------
     PRISTI_ROOT = "./PriSTI"
     CONFIG_PATH = f"{PRISTI_ROOT}/config/base.yaml"
     WEIGHTS_PATH = f"{PRISTI_ROOT}/save/aqi36/model.pth"
     MEANSTD_PK   = f"{PRISTI_ROOT}/data/pm25/pm25_meanstd.pk"
-    pristi_ready = (len(missing_df.columns) >= 36
-                    and os.path.exists(CONFIG_PATH)
-                    and os.path.exists(WEIGHTS_PATH)
-                    and os.path.exists(MEANSTD_PK))
+    pristi_ready = (
+        len(missing_df.columns) >= 36
+        and os.path.exists(CONFIG_PATH)
+        and os.path.exists(WEIGHTS_PATH)
+        and os.path.exists(MEANSTD_PK)
+    )
     if not pristi_ready:
-        st.error("PriSTI backend not available (need config/weights/meanstd and ≥36 sensors)."); return
+        st.error("PriSTI backend not available (need config/weights/meanstd and ≥36 sensors).")
+        return
 
-    pristi_cols = list(missing_df.columns)[:36]
-    pristi_model, pristi_mean, pristi_std = load_pristi_artifacts(CONFIG_PATH, WEIGHTS_PATH, MEANSTD_PK, device)
-    SS["pristi_model"] = pristi_model; SS["pristi_mean"] = pristi_mean; SS["pristi_std"] = pristi_std
+    def ensure_pristi_artifacts():
+        need_reload = ("pristi_model" not in SS) or (SS.get("pristi_device") != str(device))
+        if need_reload:
+            pm, pmu, psd = load_pristi_artifacts(CONFIG_PATH, WEIGHTS_PATH, MEANSTD_PK, device=device)
+            SS["pristi_model"]  = pm
+            SS["pristi_mean"]   = pmu
+            SS["pristi_std"]    = psd
+            SS["pristi_device"] = str(device)
+    ensure_pristi_artifacts()
 
-    # Regulators (keep your logic / names)
-    c1, c2 = st.columns(2)
-    with c1:
-        cmp_sensors = st.slider("Sensors to display", 1, min(36, len(pristi_cols)),
-                                min(6, len(pristi_cols)), key="cmp_sensors")
-    with c2:
-        cmp_steps = st.slider("Timestamps to display (≤36, last)", 6, 36, 36, key="cmp_steps")
+    # ---------------- bases ----------------
+    base_df           = missing_df.copy()      # valeurs originales (NaN aux trous)
+    orig_missing_mask = base_df.isna()
+    sim_df            = sim_df.reindex(base_df.index)
 
-    # Output areas
-    ph_times = st.empty()
-    lcol, rcol = st.columns(2)
-    ph_tsg = lcol.empty()
-    ph_pri = rcol.empty()
+    all_sensor_cols = list(sim_df.columns)
+    graph_size      = int(SS.get("graph_size", DEFAULT_VALUES["graph_size"]))
+    sensor_cols     = [str(c) for c in all_sensor_cols[:graph_size]]    # TSGuard agit ici
+    pristi_cols     = list(base_df.columns)[:36]                         # PriSTI: 36 capteurs
 
-    # Buffers (comparison runs from zero; no map/other charts)
-    tsg_running_df   = missing_df.copy()
-    pristi_running_df = missing_df.copy()
-
-    # color palette for lines
-    base_palette = [
-        "#000000", "#003366", "#009999", "#006600", "#66CC66",
-        "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"
-    ]
+    # couleurs
+    base_palette = ["#000000","#003366","#009999","#006600","#66CC66","#FF9933","#FFD700","#708090",
+                    "#4682B4","#99FF33","#1F77B4","#5DA5DA","#1E90FF","#00BFFF","#00CED1","#17BECF",
+                    "#40E0D0","#20B2AA","#16A085","#1ABC9C","#2ECC71","#3CB371","#2CA02C","#00FA9A",
+                    "#7FFFD4","#ADFF2F","#F1C40F","#F4D03F","#B7950B","#4B0082","#6A5ACD","#7B68EE",
+                    "#483D8B","#3F51B5","#2E4057","#A9A9A9"]
     color_map = {c: base_palette[i % len(base_palette)] for i, c in enumerate(pristi_cols)}
 
-    # iteration from the beginning
+    # ---------------- store PERSISTANT par timeline ----------------
+    TL_SIG = timeline_signature(base_df.index, pristi_cols)
+    SS.setdefault("impute_store", {})
+    store = SS["impute_store"].get(TL_SIG)
+    if store is None:
+        store = {
+            "tsg_imp": pd.DataFrame(index=base_df.index, columns=pristi_cols, dtype=float),
+            "pri_imp": pd.DataFrame(index=base_df.index, columns=pristi_cols, dtype=float),
+            # ensembles de timestamps imputés (par capteur) conservés en pd.Timestamp
+            "tsg_idx": {c: set() for c in pristi_cols},
+            "pri_idx": {c: set() for c in pristi_cols},
+            # état d'avancement
+            "t_times": pd.Series(np.nan, index=base_df.index, dtype=float),
+            "p_times": pd.Series(np.nan, index=base_df.index, dtype=float),
+            "i_done": -1,
+            "first_window_shown": False,
+            "sum_lastN_pri_ms": 0.0,
+            "sum_lastN_tsg_ms": 0.0,
+        }
+        SS["impute_store"][TL_SIG] = store
+
+    # ---------------- affichage ----------------
+    def build_display(ts_index, which: str):
+        base_block = base_df.reindex(ts_index)[pristi_cols]
+        if which == "tsg":
+            imp_vals = store["tsg_imp"].reindex(ts_index)[pristi_cols]
+            idx_sets = store["tsg_idx"]
+        else:
+            imp_vals = store["pri_imp"].reindex(ts_index)[pristi_cols]
+            idx_sets = store["pri_idx"]
+        display = base_block.copy()
+        have_imp = imp_vals.notna()
+        display[have_imp] = imp_vals[have_imp]
+        return display, idx_sets
+
+    def plot_block(display_df, idx_sets, cols_show, title):
+        import numpy as np
+        import pandas as pd
+        fig = go.Figure()
+
+        for col in cols_show:
+            if col not in display_df.columns: continue
+            base_color = color_map.get(col, "#444")
+            s = display_df[col]
+            notna_mask = s.notna()
+            if not notna_mask.any(): continue
+
+            x_idx  = display_df.index[notna_mask]               # DatetimeIndex exact
+            y_vals = s.loc[x_idx].to_numpy(dtype=float)
+
+            # construire l'index des timestamps imputés (robuste)
+
+            # FLAGS ROUGES: Index.isin -> ndarray (PAS de .to_numpy ici)
+            # x_idx : DatetimeIndex exact de la série tracée
+            imp_times = list(idx_sets.get(col, set()))
+            imp_idx = pd.DatetimeIndex(pd.to_datetime(imp_times, errors="coerce")).dropna()
+
+            # Membership robuste : compare en nanosecondes (évite tz/dtype)
+            imp_flags = np.isin(x_idx.asi8, imp_idx.asi8)
+
+            x_vals = x_idx.to_pydatetime().tolist()
+            add_segmented_curve(fig, x_vals, y_vals, imp_flags, base_color, gap_hours=6.0)
+
+            red_pos = np.where(imp_flags)[0]
+            if red_pos.size:
+                fig.add_trace(go.Scatter(
+                    x=[x_vals[j] for j in red_pos],
+                    y=y_vals[red_pos],
+                    mode="markers",
+                    marker=dict(size=6, color="red"),
+                    name="Imputed (points)",
+                    showlegend=False
+                ))
+
+        # légende
+        for col in cols_show:
+            fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
+                                     marker=dict(size=8, color=color_map.get(col, "#444")),
+                                     showlegend=True, name=f"{col}"))
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode='lines',
+                                 line=dict(width=2, color="red"),
+                                 showlegend=True, name="Imputed segment"))
+
+        fig.update_layout(title=title, xaxis_title="Time", yaxis_title="Value")
+        lightify(fig)
+        return fig
+
+    # ---------------- UI sliders ----------------
+    sliders = st.container()
+    cache_key_short = TL_SIG[:10]  # compact
+    def _ui_only_changed(): st.session_state["_ui_only_rerun"] = True
+
+    first_window_ready = bool(store["first_window_shown"]) or (store["i_done"] >= (eval_len - 1))
+    if first_window_ready:
+        st.session_state.setdefault(f"cmp_sensors_{cache_key_short}", min(6, len(pristi_cols)))
+        st.session_state.setdefault(f"cmp_steps_{cache_key_short}",   min(36, eval_len))
+        with sliders:
+            c1, c2 = st.columns(2)
+            cmp_sensors = c1.slider("Sensors to display", 1, min(36, len(pristi_cols)),
+                                    st.session_state[f"cmp_sensors_{cache_key_short}"],
+                                    key=f"cmp_sensors_{cache_key_short}", on_change=_ui_only_changed)
+            cmp_steps   = c2.slider("Timestamps to display (≤36, last)", 6, 36,
+                                    st.session_state[f"cmp_steps_{cache_key_short}"],
+                                    key=f"cmp_steps_{cache_key_short}", on_change=_ui_only_changed)
+    else:
+        with sliders:
+            st.caption("⏳ Computing the first 36-step window… sliders will appear here once ready.")
+        cmp_sensors = min(6, len(pristi_cols))
+        cmp_steps   = min(36, eval_len)
+
+    def render_from_cache(cmp_sensors_val, cmp_steps_val):
+        # fenêtre qui SE TERMINE au dernier timestamp effectivement calculé
+        end_i = store.get("i_done", -1)
+        if end_i < 0:
+            # rien de calculé → on affiche simplement le début
+            start_i = 0
+            end_i = min(len(base_df.index) - 1, cmp_steps_val - 1)
+        else:
+            end_i = int(min(end_i, len(base_df.index) - 1))
+            start_i = max(0, end_i - cmp_steps_val + 1)
+
+        ts_index = base_df.index[start_i:end_i + 1]
+
+        disp_tsg, tsg_sets = build_display(ts_index, "tsg")
+        disp_pri, pri_sets = build_display(ts_index, "pri")
+        cols_show = pristi_cols[:cmp_sensors_val]
+
+        c1, c2 = st.columns(2)
+        c1.plotly_chart(plot_block(disp_tsg, tsg_sets, cols_show, "TSGuard"),
+                        use_container_width=True, key="plot_tsg")
+        c2.plotly_chart(plot_block(disp_pri, pri_sets, cols_show, "PriSTI"),
+                        use_container_width=True, key="plot_pri")
+
+        st.caption(
+            f"Red pts in window — TSGuard: "
+            f"{sum(len(set(tsg_sets[c]) & set(ts_index)) for c in cols_show)} • "
+            f"PriSTI: {sum(len(set(pri_sets[c]) & set(ts_index)) for c in cols_show)}"
+        )
+        st.markdown(
+            f"**Imputation time — PriSTI: {store['sum_lastN_pri_ms']:.1f} ms • "
+            f"TSGuard: {store['sum_lastN_tsg_ms']:.1f} ms**"
+        )
+
+    if st.session_state.get("_ui_only_rerun"):
+        st.session_state["_ui_only_rerun"] = False
+        render_from_cache(st.session_state[f"cmp_sensors_{cache_key_short}"],
+                          st.session_state[f"cmp_steps_{cache_key_short}"])
+        return
+
+    # ---------------- compute / resume ----------------
+    if not store["first_window_shown"]:
+        status_box = st.status("Preparing first 36-step window…", expanded=True)
+        prog = st.progress(0)
+    else:
+        status_box = None; prog = None
+
+    live_l, live_r = st.columns(2)
+    index_all = list(base_df.index); n_total = len(index_all)
     col_to_idx = {c: i for i, c in enumerate(sensor_cols)}
-    use_model = model is not None
-    if use_model: model.eval()
+    if model is not None: model.eval()
 
-    start_time = time.perf_counter()
-    first_window_done = False
+    for i in range(store["i_done"] + 1, n_total):
+        ts = pd.Timestamp(index_all[i])
 
-    for i, ts in enumerate(common_index):
-        ts = pd.Timestamp(ts)
-
-        # ---- TSGuard: impute ONLY where originally missing at ts (your logic) ----
+        # ---- TSGuard ----
         hist_end = ts - pd.Timedelta(hours=1)
-        if hist_end in tsg_running_df.index:
-            hist_idx = tsg_running_df.loc[:hist_end].index[-window_hours:]
+        if hist_end in base_df.index:
+            hist_idx = base_df.loc[:hist_end].index[-window_hours:]
         else:
-            hist_idx = tsg_running_df.index[tsg_running_df.index < ts][-window_hours:]
-        if len(hist_idx) > 0:
-            hist_win = tsg_running_df.loc[hist_idx, sensor_cols].copy()
-        else:
-            # DataFrame vide MAIS avec les mêmes colonnes pour éviter KeyError
-            hist_win = pd.DataFrame(columns=sensor_cols)
+            hist_idx = base_df.index[base_df.index < ts][-window_hours:]
+        hist_win = base_df.loc[hist_idx, sensor_cols].copy() if len(hist_idx) else pd.DataFrame(columns=sensor_cols)
 
-        baseline_row = orig_missing_baseline.reindex(index=[ts], columns=sensor_cols).iloc[0]
+        t0 = time.perf_counter()
+        miss_row = orig_missing_mask.reindex(index=[ts], columns=sensor_cols).iloc[0]
         for col in sensor_cols:
-            if bool(baseline_row[col]):  # originally missing → impute
-                if not hist_win.empty and use_model:
+            if bool(miss_row[col]):
+                if not hist_win.empty and (model is not None):
                     try:
                         pred_val = predict_single_missing_value(
                             historical_window=np.asarray(hist_win.values, dtype=np.float32),
@@ -2426,96 +2696,83 @@ def run_tsguard_vs_pristi_comparison(
                         pred_val = _last_observed(hist_win, col)
                 else:
                     pred_val = _last_observed(hist_win, col)
+                if pd.notna(pred_val) and col in store["tsg_imp"].columns:
+                    store["tsg_imp"].at[ts, col] = pred_val
+                    store["tsg_idx"][col].add(ts)  # pd.Timestamp
+        store["t_times"].at[ts] = time.perf_counter() - t0
 
-                tsg_running_df.at[ts, col] = pred_val if pd.notna(pred_val) else np.nan
-
-            # else: keep the original value at ts
-
-        # ---- PriSTI: when we have ≥ eval_len steps, impute the last 36 window ----
-        try:
-            end_loc = pristi_running_df.index.get_loc(ts)
-        except KeyError:
-            end_loc = None
-
-        if isinstance(end_loc, int) and (end_loc + 1) >= eval_len:
+        # ---- PriSTI ----
+        end_loc = base_df.index.get_loc(ts)
+        if isinstance(end_loc, (int, np.integer)) and (end_loc + 1) >= eval_len:
             start_loc = end_loc - (eval_len - 1)
-            time_index = pristi_running_df.index[start_loc:end_loc + 1]
-
-            pri_t0 = time.perf_counter()
+            time_index = base_df.index[start_loc:end_loc + 1]
+            t0p = time.perf_counter()
             updated_df, info = impute_window_with_pristi(
-                missing_df=pristi_running_df.copy(),
-                sensor_cols=pristi_cols,
-                target_timestamp=ts,
-                model=pristi_model,
-                device=device, eval_len=eval_len, nsample=100
+                missing_df=base_df.copy(), sensor_cols=pristi_cols,
+                target_timestamp=ts, model=SS["pristi_model"], device=device,
+                eval_len=eval_len, nsample=100
             )
-            pri_dt = time.perf_counter() - pri_t0
+            store["p_times"].at[ts] = time.perf_counter() - t0p
             if info == "ok":
-                pristi_running_df.loc[time_index, pristi_cols] = updated_df.loc[time_index, pristi_cols].values
+                pri_mask_win = orig_missing_mask.reindex(index=time_index, columns=pristi_cols).fillna(False)
+                upd_win      = updated_df.reindex(index=time_index, columns=pristi_cols)
+                filled_win   = pri_mask_win & upd_win.notna()
 
-            # ---- Build & show comparison figures (ONLY the comparison) ----
-            cols_show = pristi_cols[:cmp_sensors]
-            mask_block = orig_missing_baseline.reindex(index=time_index, columns=pristi_cols).fillna(False)
+                current = store["pri_imp"].loc[time_index, pristi_cols]
+                store["pri_imp"].loc[time_index, pristi_cols] = current.where(~filled_win, upd_win)
 
-            tsg_block = tsg_running_df.loc[time_index, pristi_cols].copy()
-            pri_block = pristi_running_df.loc[time_index, pristi_cols].copy()
+                for col in pristi_cols:
+                    hits = filled_win.index[filled_win[col]]
+                    if len(hits):
+                        store["pri_idx"][col].update(hits)  # hits: DatetimeIndex → pd.Timestamp
 
-            # PriSTI display = original values, replaced ONLY on originally-missing cells
-            base_block = orig_values_frozen.loc[time_index, pristi_cols].copy()
-            display_pri = base_block.copy()
-            display_pri[mask_block] = pri_block[mask_block]
+        # temps cumulés (≤ eval_len derniers pas)
+        t_idx = store["t_times"].dropna().index
+        if len(t_idx):
+            lastNt = t_idx[-min(eval_len, len(t_idx)):]
+            store["sum_lastN_tsg_ms"] = float(np.nansum(store["t_times"].reindex(lastNt).values) * 1000.0)
+        p_idx = store["p_times"].dropna().index
+        if len(p_idx):
+            lastNp = p_idx[-min(eval_len, len(p_idx)):]
+            store["sum_lastN_pri_ms"] = float(np.nansum(store["p_times"].reindex(lastNp).values) * 1000.0)
 
-            def _window_lines(fig, block, mask_df, cmap):
-                sub_df = block.reset_index()
-                first_col = sub_df.columns[0]
-                if first_col != "datetime":
-                    sub_df = sub_df.rename(columns={first_col: "datetime"})
-                for col in block.columns:
-                    if col not in cols_show: continue
-                    base_color = cmap.get(col, "#444")
-                    xy = (sub_df[["datetime", col]].dropna()
-                          .sort_values("datetime").rename(columns={col: "value"}))
-                    if xy.empty: continue
-                    def is_imp(t):
-                        try: return bool(mask_df.loc[t, col])
-                        except: return False
-                    add_imputed_segments(fig, xy, is_imp, base_color, gap_hours=6)
-                for col in cols_show:
-                    fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
-                                             marker=dict(size=8, color=cmap.get(col, "#444")),
-                                             showlegend=True, name=f"{col}"))
-                fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
-                                         marker=dict(size=8, color="red"),
-                                         showlegend=True, name="Imputed segment"))
+        store["i_done"] = i
+        SS["impute_store"][TL_SIG] = store
 
-            cmap = {c: color_map[c] for c in cols_show}
-            tsg_show  = tsg_block.iloc[-cmp_steps:, :][cols_show]
-            pri_show  = display_pri.iloc[-cmp_steps:, :][cols_show]
-            mask_show = mask_block.iloc[-cmp_steps:, :][cols_show]
+        # première fenêtre (36) → live
+        if not store["first_window_shown"]:
+            pct = min(100, int((i + 1) * 100 / max(eval_len, 1)))
+            if prog: prog.progress(pct)
+            if (i + 1) >= eval_len:
+                end_i   = i
+                start_i = max(0, end_i - 36 + 1)
+                ts_idx  = base_df.index[start_i:end_i + 1]
 
-            fig_tsg = go.Figure(); _window_lines(fig_tsg, tsg_show, mask_show, cmap)
-            fig_pri = go.Figure(); _window_lines(fig_pri, pri_show, mask_show, cmap)
-            for _f in (fig_tsg, fig_pri):
-                _f.update_layout(title=None, xaxis_title="Time", yaxis_title="Value",
-                                 margin=dict(l=10, r=10, t=20, b=10))
-                lightify(_f)
+                disp_tsg, tsg_sets = build_display(ts_idx, "tsg")
+                disp_pri, pri_sets = build_display(ts_idx, "pri")
+                cols_live = pristi_cols[:min(6, len(pristi_cols))]
+                live_l.plotly_chart(plot_block(disp_tsg, tsg_sets, cols_live, "TSGuard (live)"), use_container_width=True)
+                live_r.plotly_chart(plot_block(disp_pri, pri_sets, cols_live, "PriSTI (live)"),  use_container_width=True)
 
-            ph_times.markdown(
-                f"**Imputation time @ {ts}** — PriSTI: {pri_dt*1000:.1f} ms  •  TSGuard computed per-step."
-            )
-            ph_tsg.plotly_chart(fig_tsg, use_container_width=True, key=f"cmp_tsg_{int(ts.value)}")
-            ph_pri.plotly_chart(fig_pri, use_container_width=True, key=f"cmp_pri_{int(ts.value)}")
+                if prog: prog.empty()
+                if status_box: status_box.update(label="✅ First 36-step window ready.", state="complete")
+                store["first_window_shown"] = True
+                SS["impute_store"][TL_SIG] = store
 
-            if not first_window_done:
-                first_window_done = True
-                ph_status.success("First 36-step window ready. Comparison is running.", icon="✅")
+                with sliders:
+                    c1, c2 = st.columns(2)
+                    c1.slider("Sensors to display", 1, min(36, len(pristi_cols)),
+                              min(6, len(pristi_cols)), key=f"cmp_sensors_{cache_key_short}", on_change=_ui_only_changed)
+                    c2.slider("Timestamps to display (≤36, last)", 6, 36,
+                              36, key=f"cmp_steps_{cache_key_short}", on_change=_ui_only_changed)
+                st.session_state["_ui_only_rerun"] = True
+                st.stop()
 
-        else:
-            # still building up the first 36 steps
-            have = (end_loc + 1) if isinstance(end_loc, int) else 0
-            need = max(0, eval_len - have)
-            ph_status.info(f"⏳ Preparing the first window… need {need} more timestamp(s).", icon="⏳")
+    # ---------------- final render ----------------
+    render_from_cache(
+        st.session_state.get(f"cmp_sensors_{cache_key_short}", min(6, len(pristi_cols))),
+        st.session_state.get(f"cmp_steps_{cache_key_short}",   min(36, eval_len))
+    )
 
-        # pacing a little so UI updates are visible
-        time.sleep(0.1)
+
 

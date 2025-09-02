@@ -47,51 +47,7 @@ st.set_page_config(
 # -----------------------------------------------------------------------------
 # Global CSS (professional + your tweaks)
 # -----------------------------------------------------------------------------
-# ---- About TSGuard (Markdown content) ---------------------------------------
-ABOUT_TS_GUARD_MD = """
-### About TSGuard
 
-**TSGuard** is a lightweight, real-time system for detecting and imputing missing values in streaming environmental time series.
-
-**What it does**
-- Monitors large networks of sensors and repairs delayed/missing readings on the fly.
-- Preserves physical plausibility through **domain range constraints** applied to every imputed value.
-- Keeps the interface responsive so operators can see the state of the network as it evolves.
-
-**How it works (under the hood)**
-- **Spatial structure** is captured with a **Graph Neural Network (GNN)** that relates each station to its neighbors.
-- **Temporal continuity** is captured with an **LSTM**, modeling smooth changes over time.
-- The hybrid GNN+LSTM design lets TSGuard impute values for a sensor using both nearby stations **and** recent history.
-- A simple validator enforces **domain-specific bounds** (e.g., acceptable ranges for air-quality metrics) before values are displayed.
-
-**What you’re seeing in the demo**
-- **Live Map (left)**: each station updates in real time — **green = real** reading, **red = imputed** reading at that timestamp.
-- **Gauge (right of map)**: **cumulative percentage of originally-missing data** seen so far on the displayed sensors.
-- **Global Time Series (below)**: full history of the displayed sensors; red segments highlight intervals containing imputed points.
-- **Snapshot (last 10 timestamps)**: a compact, synchronized view of the most recent window for quick trend checks.
-- **Active / Delayed counters**: numbers shown next to the gauge reflect, at the *current timestamp*, how many sensors were observed vs. missing originally.
-
-**Comparison mode (TSGuard vs PriSTI)**
-- PriSTI is a strong baseline model but **heavier to compute**; the comparison page runs it separately.
-- PriSTI can alter some observed values in its internal reconstructions.  
-  In this demo, we show PriSTI **only on cells that were originally missing**, and we keep the **original values** elsewhere — so comparisons are fair.
-- The comparison uses **non-overlapping 36-step windows**; the **first window needs to fill** before plots appear.
-- Sliders let you control how many **sensors** and **timestamps** to display in the side-by-side charts.
-
-**Why it matters**
-- Environmental networks face **delays, outages, and sensor drift**. TSGuard recovers missing values quickly while respecting domain limits.
-- The approach is **online** and **lightweight**, making it suitable for operational dashboards with minimal latency.
-
-**Dataset in the demo**
-- We illustrate the system on **AQI-36**, a network of 36 air-quality stations, to show real-time recovery and plausibility monitoring.
-
-**Notes & limitations**
-- Imputation quality depends on **graph topology**, **window length**, and **data coverage**.
-- Until the first comparison window is ready, the PriSTI panel shows a warm-up message.
-- If a GPU isn’t available, PriSTI may take longer to compute; TSGuard stays responsive.
-
-If you reference this demo, please cite our **TSGuard demo paper**.
-"""
 
 st.markdown("""
 <style>
@@ -286,18 +242,11 @@ def render_header():
               <b>About TSGuard (quick)</b><br/>
               Real-time detection and imputation of missing values in streaming environmental data, driven by a hybrid GNN+LSTM model with domain range checks.
               <br/><br/>
-              <i>Open the “About TSGuard” section below for the full description.</i>
-            </div>
-          </details>
-        </div>
-        <div class="ts-rule"></div>
-      </div>
-    </div>
     """, unsafe_allow_html=True)
 
-    # Full "About" content right under the header
-    with st.expander("About TSGuard", expanded=False):
-        st.markdown(ABOUT_TS_GUARD_MD)
+    # # Full "About" content right under the header
+    # with st.expander("About TSGuard", expanded=False):
+    #     st.markdown(ABOUT_TS_GUARD_MD)
 
 
 # -----------------------------------------------------------------------------
@@ -373,7 +322,7 @@ def render_first_view():
 # -----------------------------------------------------------------------------
 # Footer (logos)
 # -----------------------------------------------------------------------------
-LOGO_UL = "images/UNI logo.jpeg"
+LOGO_UL = "images/UNI logo.png"
 LOGO_ESI = "images/ESI_Logo.png"
 LOGO_CH = "images/Logo-UHBC.png"
 LOGO_UP = "images/Logo_UniParis.png"
@@ -399,7 +348,7 @@ def render_sidebar_logos():
 
     logos_html = '<div class="sidebar-logos">'
     if ul_b64:
-        logos_html += f'<a href="https://www.univ-lorraine.fr" target="_blank" data-tooltip="Université de Lorraine"><img src="{ul_b64}" /></a>'
+        logos_html += f'<a href="https://www.uni.lu" target="_blank" data-tooltip="University of Luxembourg"><img src="{ul_b64}" /></a>'
     if esi_b64:
         logos_html += f'<a href="https://www.esi.dz" target="_blank" data-tooltip="École Nationale Supérieure d’Informatique (ESI)"><img src="{esi_b64}" /></a>'
     if ch_b64:
@@ -470,6 +419,23 @@ def main():
     hide_sidebar_when_ready(files_ready)
 
     render_header()
+    # A placeholder for the idle prompt
+    idle_prompt = st.empty()
+
+    # Read flags once
+    page = st.session_state.get("page", "sim")
+    running = st.session_state.get("running", False)
+    training = st.session_state.get("training", False)
+
+    # Show the prompt only when the app is idle on the sim page
+    if page == "sim" and not running and not training:
+        idle_prompt.info(
+            "Choose an action: 🧠 **Start TSGuard training** to train the model, "
+            "▶️ **Start TSGuard Simulation** to start the simulation, or "
+            "📊 **TSGuard vs PriSTI** to open the comparison."
+        )
+    else:
+        idle_prompt.empty()
 
     # Settings (open by default: set expanded=True in your settings component)
     settings.add_setting_panel()
@@ -505,6 +471,8 @@ def main():
 
     # Training
     if st.session_state.training:
+        idle_prompt.empty()
+        st.session_state.settings_open = False
         st.title("⏳ Training is running... Please wait.")
         with st.spinner("Training GNN model..."):
             model_path = DEFAULT_VALUES["training_file_path"]
@@ -528,13 +496,17 @@ def main():
 
     if page == "cmp":
         # Page comparaison — indépendante de `running`
-        st.info("📊 Comparison page (TSGuard vs PriSTI).")
+        idle_prompt.empty()
+        st.session_state.settings_open = False
+        #st.info("📊 Comparison page (TSGuard vs PriSTI).")
         run_tsguard_vs_pristi_comparison(
             sim_df=tr, missing_df=df, model=model, scaler=scaler, inv_scaler=inv_scaler, device=device
         )
 
     else:  # page == "sim"
         if st.session_state.get("running", False):
+            idle_prompt.empty()
+            st.session_state.settings_open = False
             st.success("✅ Simulation is running. Click '📊 TSGuard vs PTISTI' to open the comparison page.")
             run_simulation_with_live_imputation(
                 sim_df=tr,
@@ -548,11 +520,6 @@ def main():
                 sliding_chart_placeholder=sliding_ph,
                 gauge_placeholder=gauge_ph,
                 window_hours=24,
-            )
-        else:
-            st.info(
-                "Choose an action: 🧠 **Start TSGuard training** to train the model, ▶️ **Start TSGuard Simulation** to start the simulation, or 📊 **TSGuard vs PriSTI** to open the comparison."
-
             )
 
     render_sidebar_logos()
