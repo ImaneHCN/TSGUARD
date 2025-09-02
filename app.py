@@ -496,6 +496,7 @@ def main():
 
     if page == "cmp":
         # Page comparaison — indépendante de `running`
+
         idle_prompt.empty()
         st.session_state.settings_open = False
         #st.info("📊 Comparison page (TSGuard vs PriSTI).")

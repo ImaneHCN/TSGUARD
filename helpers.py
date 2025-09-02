@@ -28,17 +28,33 @@ def load_training_data(file):
 
 
 @st.cache_data
-def load_sensor_data(file):
-    """Load sensor data from a .txt file (CSV format)."""
-    df = pd.read_csv(file)
-    if "datetime" not in df.columns:
-        for candidate in ["timestamp", "date"]:
-            if candidate in df.columns:
-                df.rename(columns={candidate: "datetime"}, inplace=True)
-                break
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df.sort_values("datetime", inplace=True)
+def load_sensor_data(path: str) -> pd.DataFrame:
+    import pandas as pd
+
+    df = pd.read_csv(path)
+
+    # Normalize datetime column
+    if "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    elif "timestamp" in df.columns:
+        df = df.rename(columns={"timestamp": "datetime"})
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    elif "date" in df.columns:
+        df = df.rename(columns={"date": "datetime"})
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    elif "time" in df.columns:
+        df = df.rename(columns={"time": "datetime"})
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    elif isinstance(df.index, pd.DatetimeIndex):
+        df = df.reset_index().rename(columns={"index": "datetime"})
+    else:
+        raise KeyError("No datetime-like column found in the file.")
+
+    # Drop rows without valid datetime
+    df = df.dropna(subset=["datetime"]).copy()
+
     return df
+
 
 
 @st.cache_data

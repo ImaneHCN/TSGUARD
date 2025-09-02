@@ -2474,7 +2474,7 @@ def run_simulation_with_live_imputation(
                 try: return bool(SS.imputed_mask.loc[t, c])
                 except: return False
             add_imputed_segments(snap10_fig, sub, is_imp, base_color, gap_hours=6)
-        snap10_fig.update_layout(title="Snapshot (last 10 timestamps)",
+        snap10_fig.update_layout(title="Snapshot (last 10)",
                                  xaxis_title="Time", yaxis_title="Value",
                                  margin=dict(l=20, r=20, t=40, b=20),
                                  showlegend=False)
