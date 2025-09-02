@@ -24,6 +24,10 @@ import yaml
 from typing import List, Tuple, Optional
 # ---- Plotly: force light theme globally ----
 import plotly.io as pio
+# ---- Dismissible alerts -----------------------------------------------------
+from typing import Optional
+from uuid import uuid4
+
 pio.templates.default = "plotly_white"
 
 LIGHT_BG = "rgba(0,0,0,0)"
@@ -40,6 +44,48 @@ from uuid import uuid4
 # ---------- Sticky alerts (top-right) ----------
 import time
 import streamlit as st
+# ---------------- Alert message templates ----------------
+ALERT = {
+    "SCENARIO_1_WAITING": (
+        "Delayed data for sensor {sid} (t={ts}). "
+        "Waiting for late data! ⏳"
+    ),
+    "SCENARIO_2_IMPUTED_OK": (
+        "✅ Imputation completed for sensor {sid} at {ts}. "
+        "The reconstructed value is within the expected range"
+    ),
+    "SCENARIO_2_IMPUTED_OOR": (
+        "⚠️ Imputation out of range for sensor {sid} at {ts}. "
+        "The reconstructed value violates domain constraints. Please review."
+    ),
+    "SCENARIO_2_NEIGHBOR_MISMATCH": (
+        "🚨 Potential anomaly near sensor {sid} at {ts}. "
+        "The imputed value is within range, but one or more neighboring stations are out of range. "
+        #"Naïve imputation could hide an environmental event — immediate attention recommended."
+    ),
+    "SCENARIO_3_HIST_IMPUTE": (
+        "ℹ️ Neighbor data unavailable. Imputed {sid} at {ts} using historical patterns. "
+        #"Monitor closely until live data resumes."
+    ),
+    "SCENARIO_3_NO_ESTIMATE": (
+        "🚨 No reliable estimate for sensor {sid} at {ts}. "
+        "Target and neighboring stations are missing. Possible sensor or system fault."
+    ),
+}
+
+# Optional: short labels (for badges/toasts)
+ALERT_SHORT = {
+    "WAIT": "Waiting for late data",
+    "OK": "Imputed (within range)",
+    "OOR": "Imputed (out of range)",
+    "NB_MISMATCH": "Neighbor inconsistency",
+    "HIST": "Imputed from history",
+    "NO_EST": "No reliable estimate",
+}
+
+# ---- Dismissible alerts -----------------------------------------------------
+from typing import Optional
+from uuid import uuid4
 
 def _init_alert_store(max_items:int=20):
     SS = st.session_state
@@ -198,11 +244,19 @@ def _month_name_from_ts(ts: pd.Timestamp) -> str:
 
 def _neighbors_within_km(latlng_df: pd.DataFrame, km: float) -> dict[str, list[str]]:
     """Build neighbor lists by distance threshold (km). Keys are sensor_id (string)."""
-    ids = latlng_df["sensor_id"].astype(str).tolist()
-    lat = latlng_df["latitude"].astype(float).to_numpy()
-    lon = latlng_df["longitude"].astype(float).to_numpy()
+    # Drop duplicate columns (keep first occurrence)
+    latlng_df = latlng_df.loc[:, ~latlng_df.columns.duplicated()].copy()
 
-    # simple O(N^2) because N is small on screen; fine for UI
+    # Force single Series even if duplicates exist upstream
+    sid_series = latlng_df["sensor_id"]
+    if isinstance(sid_series, pd.DataFrame):
+        sid_series = sid_series.iloc[:, 0]
+
+    ids = sid_series.astype(str).to_numpy().tolist()
+    lat = pd.to_numeric(latlng_df["latitude"], errors="coerce").to_numpy()
+    lon = pd.to_numeric(latlng_df["longitude"], errors="coerce").to_numpy()
+
+    # Simple O(N^2) neighbor search
     neigh = {sid: [] for sid in ids}
     for i in range(len(ids)):
         for j in range(i + 1, len(ids)):
@@ -1607,15 +1661,33 @@ def verify_constraints_and_alerts_for_timestamp(
     baseline_row: pd.Series,
     missing_streak_hours: Optional[dict] = None,
 ):
+    """
+    Emit alert/toast messages for the current timestamp:
+      - Scenario 1: missing but delay below Δt_i  (waiting)
+      - Scenario 2: delay above Δt_i and neighbors available (with 2.x sub-cases where applicable)
+      - Scenario 3: delay above Δt_i and neighbors unavailable (historical imputation or no estimate)
+      - Temporal and spatial constraint warnings
+    All comments and alert texts are in English.
+
+    Inputs:
+      - latlng_df columns: ["sensor_id", "data_col", "latitude", "longitude"]
+      - values_by_col keys: data_col
+      - baseline_row: True where originally missing at ts (indexed by data_col)
+      - imputed_mask_row: True where value was imputed at ts (indexed by data_col)
+      - missing_streak_hours: per data_col ongoing missing streak in hours
+    """
     import numpy as np
     import streamlit as st
     from utils.config import DEFAULT_VALUES
 
-    buf = TickAlertBuffer()  # <-- NOUVEAU
+    # Buffer for grouped cards (we keep your infra but primarily use toasts for real-time UX)
+    buf = TickAlertBuffer()
+
     constraints = st.session_state.get("constraints", [])
     sigma_minutes = float(st.session_state.get("sigma_threshold", DEFAULT_VALUES.get("sigma_threshold", 30)))
     sigma_hours = max(0.0, sigma_minutes / 60.0)
 
+    # Persistent fault/waiting state to avoid spam across ticks
     if "_fault_state" not in st.session_state:
         st.session_state["_fault_state"] = {}
     fault_state = st.session_state["_fault_state"]
@@ -1623,6 +1695,7 @@ def verify_constraints_and_alerts_for_timestamp(
     spatial_rules  = [c for c in constraints if c.get("type") == "Spatial"]
     temporal_rules = [c for c in constraints if c.get("type") == "Temporal"]
 
+    # Prepare a quick lat/long lookup for spatial rules
     if spatial_rules:
         pos_map = {str(r["data_col"]): (float(r["latitude"]), float(r["longitude"]))
                    for _, r in latlng_df.iterrows() if str(r.get("data_col")) in values_by_col}
@@ -1632,107 +1705,172 @@ def verify_constraints_and_alerts_for_timestamp(
             a=sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
             return 2*R*atan2(sqrt(a), sqrt(1-a))
 
-    for sid, val in values_by_col.items():
+    # --- Neighbor availability map (use the largest spatial radius) ---
+    try:
+        max_km = max(float(c.get("distance in km", 0)) for c in spatial_rules) if spatial_rules else 0.0
+    except Exception:
+        max_km = 0.0
+
+    if max_km > 0 and not latlng_df.empty:
+        # Build a clean DF keyed by data_col (not the display sensor_id) to match values_by_col/baseline_row keys
+        latlng_for_neigh = pd.DataFrame({
+            "sensor_id": latlng_df["data_col"].astype(str),
+            "latitude": pd.to_numeric(latlng_df["latitude"], errors="coerce"),
+            "longitude": pd.to_numeric(latlng_df["longitude"], errors="coerce"),
+        }).dropna(subset=["latitude", "longitude"])
+        neigh_map = _neighbors_within_km(latlng_for_neigh, max_km)  # {data_col: [data_col, ...]}
+    else:
+        neigh_map = {}
+
+    # A neighbor is considered "available" if it was originally present (not missing) at this timestamp
+    present_cols = {k for k, miss in baseline_row.items() if not bool(miss)}
+
+    # Helper for clean toast emission
+    def emit_toast(level: str, text: str, dedup: str):
+        toast_notify(level, text, dedup_key=dedup)
+
+    # ---- Constraint checks (Temporal + Spatial), independent of scenarios ----
+    # Evaluate per-sensor temporal rules
+    for data_col, val in values_by_col.items():
         v = None if (val is None or (isinstance(val, float) and np.isnan(val))) else float(val)
-        was_missing = bool(baseline_row.get(sid, False))
-        is_imputed  = bool(imputed_mask_row.get(sid, False)) if imputed_mask_row is not None else False
-        streak_h    = float((missing_streak_hours or {}).get(sid, 0.0))
+        if v is None or not temporal_rules:
+            continue
+        month_name = ts.strftime("%B")
+        for rule in temporal_rules:
+            if rule.get("type") != "Temporal":
+                continue
+            if rule.get("month") != month_name:
+                continue
+            opt = rule.get("option", "").lower()
+            try:
+                thr = float(rule.get("temp_threshold", np.nan))
+            except Exception:
+                thr = np.nan
+            if not np.isfinite(thr):
+                continue
 
-        prev = fault_state.get(sid, "ok")
-        curr = prev
+            if opt.startswith("greater"):
+                if not (v > thr):
+                    emit_toast("warning",
+                              f"Temporal constraint: expected > {thr:g}, got {v:.2f} for {data_col} at {ts}.",
+                              f"tmp-gt-{data_col}-{ts}")
+            elif opt.startswith("less"):
+                if not (v < thr):
+                    emit_toast("warning",
+                              f"Temporal constraint: expected < {thr:g}, got {v:.2f} for {data_col} at {ts}.",
+                              f"tmp-lt-{data_col}-{ts}")
 
-        from typing import Optional
-        # remplace les buf.add(...) par ceci :
-        def _emit(level: str, title: str, line: str, ts):
-            # un toast synthétique (titre) + détail sur la 1ère ligne
-            toast_notify(level, f"{title} — {line}", dedup_key=f"{title}|{line}|{ts}")
+    # Evaluate spatial rules pairwise (avoid duplicate A–B and B–A)
+    if spatial_rules and pos_map:
+        emitted_pairs = set()
+        for rule in spatial_rules:
+            try:
+                dist_km = float(rule.get("distance in km", 0))
+                max_diff = float(rule.get("diff", np.inf))
+            except Exception:
+                continue
+            if not np.isfinite(dist_km) or dist_km <= 0 or not np.isfinite(max_diff):
+                continue
 
-        # ---- Scénarios ----
-        if was_missing and (v is None) and not is_imputed:
-            if streak_h < sigma_hours:
-                if prev != "waiting":
-                    # Scenario 1
-                    _emit("info", "Attente", f"{sid}: Δt non dépassé (streak {streak_h:.1f}h)", ts)
-            else:
-                if prev != "fault":
-                    # Scenario 3:
-                    _emit("warning", "indisponible", f"{sid}: aucune estimation fiable @ {ts}", ts)
-        else:
-            if prev in ("waiting", "fault"):
-                _emit("success", "Rétabli", f"{sid}: valeur à nouveau disponible @ {ts}", ts)
-
-        # ---- Temporel ----
-        if temporal_rules and (v is not None):
-            mo = ts.strftime("%B")
-            for rule in temporal_rules:
-                if rule.get("month") != mo: continue
-                opt = rule.get("option"); thr = rule.get("temp_threshold", None)
-                try: thr = float(thr)
-                except: continue
-                title = f"Temporal — {mo} | {opt} {thr:g}"
-                if opt == "Greater than" and not (v > thr):
-                    _emit("warning", f"Temporal — {mo} (> {thr:g})", f"{sid}: {v:.2f} ≤ {thr:g}", ts)
-                if opt == "Less than" and not (v < thr):
-                    _emit(
-                        "warning",
-                        f"Temporal — {mo} (< {thr:g})",
-                        f"{sid}: {v:.2f} ≥ {thr:g} @ {ts}",
-                        ts,
-                    )
-
-        # ---- Spatial (no duplicates, clean toast) ----
-        if spatial_rules and (v is not None) and ('pos_map' in locals()) and (sid in pos_map):
-            lat1, lon1 = pos_map[sid]
-
-            # set local pour éviter A–B et B–A au même ts
-            # (on le crée une seule fois par appel de la fonction)
-            emitted_pairs = locals().get("_spatial_emitted_pairs")
-            if emitted_pairs is None:
-                emitted_pairs = set()
-                locals()["_spatial_emitted_pairs"] = emitted_pairs
-
-            for rule in spatial_rules:
-                try:
-                    dist_km = float(rule.get("distance in km", 0))
-                    max_diff = float(rule.get("diff", np.inf))
-                except Exception:
+            title = f"Spatial — ≤{dist_km:g} km | maxΔ {max_diff:g}"
+            keys = list(values_by_col.keys())
+            for i in range(len(keys)):
+                a = keys[i]
+                va = values_by_col.get(a)
+                if va is None or (isinstance(va, float) and not np.isfinite(va)):
                     continue
-                if not np.isfinite(dist_km) or dist_km <= 0 or not np.isfinite(max_diff):
+                if a not in pos_map:
                     continue
+                lat1, lon1 = pos_map[a]
 
-                title = f"Spatial — ≤{dist_km:g} km | maxΔ {max_diff:g}"
+                for j in range(i + 1, len(keys)):
+                    b = keys[j]
+                    vb = values_by_col.get(b)
+                    if vb is None or (isinstance(vb, float) and not np.isfinite(vb)):
+                        continue
+                    if b not in pos_map:
+                        continue
 
-                for nid, nval in values_by_col.items():
-                    # 1) skip self
-                    if nid == sid:
-                        continue
-                    # 2) skip si pas de position
-                    if nid not in pos_map:
-                        continue
-                    # 3) faire chaque paire une seule fois (ordre lexicographique)
-                    a, b = (sid, nid) if sid < nid else (nid, sid)
                     pair_key = (a, b, dist_km, max_diff, pd.Timestamp(ts))
                     if pair_key in emitted_pairs:
                         continue
 
-                    nv = None if (nval is None or (isinstance(nval, float) and np.isnan(nval))) else float(nval)
-                    if nv is None:
-                        continue
-
-                    lat2, lon2 = pos_map[nid]
+                    lat2, lon2 = pos_map[b]
                     d = haversine_km(lat1, lon1, lat2, lon2)
                     if d <= dist_km:
-                        delta = abs(v - nv)
+                        delta = abs(float(va) - float(vb))
                         if delta > max_diff:
-                            line = f"{a} vs {b}: |Δ|={delta:.2f} > {max_diff:g} (d≈{d:.1f} km) @ {ts}"
-                            _emit("warning", title, line, ts)
+                            emit_toast("warning",
+                                       f"{title}: |{a}-{b}| = {delta:.2f} > {max_diff:g} (d≈{d:.1f} km) at {ts}.",
+                                       f"spat-{a}-{b}-{ts}")
                             emitted_pairs.add(pair_key)
 
-        # état persisté (anti-spam)
-        fault_state[sid] = curr
+    # ---- Scenario classification (per sensor) ----
+    for data_col, val in values_by_col.items():
+        v = None if (val is None or (isinstance(val, float) and np.isnan(val))) else float(val)
+        was_missing = bool(baseline_row.get(data_col, False))
+        is_imputed  = bool(imputed_mask_row.get(data_col, False)) if imputed_mask_row is not None else False
+        streak_h    = float((missing_streak_hours or {}).get(data_col, 0.0))
 
-    # ⚠️ flush UNE SEULE FOIS, après la boucle
+        prev = fault_state.get(data_col, "ok")
+        curr = prev
+
+        # Neighbor availability for this sensor
+        has_present_neighbor = any(n in present_cols for n in neigh_map.get(data_col, []))
+
+        if was_missing:
+            if (v is None) and not is_imputed:
+                # No value to show yet
+                if streak_h < sigma_hours:
+                    # Scenario 1 — waiting under Δt
+                    emit_toast("info",
+                               ALERT["SCENARIO_1_WAITING"].format(sid=data_col, ts=ts),
+                               f"s1-{data_col}-{ts}")
+                    curr = "waiting"
+                else:
+                    # Δt exceeded
+                    if has_present_neighbor:
+                        # Scenario 2 (neighbors available) — not yet validated; provisional warning
+                        emit_toast("warning",
+                                   ALERT["SCENARIO_2_NEIGHBOR_MISMATCH"].format(sid=data_col, ts=ts),
+                                   f"s2-wait-{data_col}-{ts}")
+                        curr = "waiting"
+                    else:
+                        # Scenario 3 — neighbors unavailable, no reliable estimate
+                        emit_toast("warning",
+                                   ALERT["SCENARIO_3_NO_ESTIMATE"].format(sid=data_col, ts=ts),
+                                   f"s3-noest-{data_col}-{ts}")
+                        curr = "fault"
+            else:
+                # We now have a value (real or imputed)
+                if streak_h >= sigma_hours and not has_present_neighbor and is_imputed:
+                    # Scenario 3 — historical imputation due to unavailable neighbors
+                    emit_toast("warning",
+                               ALERT["SCENARIO_3_HIST_IMPUTE"].format(sid=data_col, ts=ts),
+                               f"s3-hist-{data_col}-{ts}")
+                elif is_imputed and has_present_neighbor:
+                    # Scenario 2 — with neighbors; choose 2.1 / 2.2 / 2.3 depending on your checks
+                    # By default, mark as OK; replace with OOR / NEIGHBOR_MISMATCH after your validations.
+                    emit_toast("info",
+                               ALERT["SCENARIO_2_IMPUTED_OK"].format(sid=data_col, ts=ts),
+                               f"s2-ok-{data_col}-{ts}")
+
+                # Show "Restored" once when transitioning out of waiting/fault
+                if prev in ("waiting", "fault"):
+                    emit_toast("success",
+                               f"✅ Restored — {data_col} at {ts}",
+                               f"restored-{data_col}-{ts}")
+                curr = "ok"
+        else:
+            # Not originally missing at this timestamp; no scenario emission.
+            curr = "ok"
+
+        # Persist state for next ticks (spam control)
+        fault_state[data_col] = curr
+
+    # Flush grouped alert buffer (if you still use the grouped cards)
     buf.flush(ts)
+
 
 # ========= Toast notifications instead of grouped cards =========
 import time, re
@@ -1786,207 +1924,149 @@ def run_simulation_with_live_imputation(
     sim_df: pd.DataFrame,
     missing_df: pd.DataFrame,
     positions,
-    model: "torch.nn.Module|None",
+    model: torch.nn.Module,
     scaler: callable,
     inv_scaler: callable,
-    device: "torch.device|None",
+    device: torch.device,
     graph_placeholder,              # unused, kept for signature
     sliding_chart_placeholder,      # unused, kept for signature
     gauge_placeholder,              # unused, kept for signature
     window_hours: int = 24,
-    intro_delay_seconds: float = 1.0,   # 1er tick sans alertes, puis on arme
 ):
     """
-    • PLOTS: identiques à ta version (draw_full_time_series_with_mask_gap + add_imputed_segments).
-    • NOTIFS: overlay style “Facebook” en HAUT-GAUCHE.
-    • MAP: capteur 'Delayed' en JAUNE (< Δtᵢ), puis ROUGE (≥ Δtᵢ). 'Predicted' = ROUGE.
-    • Δtᵢ = st.session_state['sigma_threshold'] (minutes) → heures.
-    • Scénarios:
-        - S1 (delay < Δtᵢ): on attend → notif info “Awaiting late data”, map JAUNE.
-        - S2 (delay ≥ Δtᵢ + voisins dispo): imputation → contraintes (temporal/spatial) → notif success/erreur.
-        - S3 (delay ≥ Δtᵢ + pas de voisins/estim. fiable): notif erreur “System/Sensor fault?”.
-        - Restauration: notif success “Data restored”.
+    Drop-in: fixes Fit button (rebuilds deck with new view), places it at top-right of left column,
+    keeps map/gauge/global/snapshot10 + PriSTI/TSGuard comparison with imputation times.
+    Requires helpers & constants already defined elsewhere in your module.
     """
-    import time, uuid, math
+    import os, time, uuid
     import numpy as np
     import pandas as pd
     import plotly.graph_objects as go
     import pydeck as pdk
     import streamlit as st
-    from streamlit.components.v1 import html as st_html
-
 
     SS = st.session_state
+    # placeholder persistant pour le centre d'alertes
 
-    ICON_SPEC = SS.setdefault("_icon_spec", {
-        "url": "",
-        "width": 1,
-        "height": 1,
-        "anchorX": 0,
-        "anchorY": 0,
-    })
+    # ---------------- Alert message templates ----------------
+    ALERT = {
+        # Scenario 1 — missing value but still within the allowable delay Δt_i
+        "SCENARIO_1_WAITING": (
+            "Delayed data for sensor {sid} (t={ts}). "
+            "⏳Waiting for data.. "
+        ),
 
-    # -------------------- Defaults & helpers --------------------
-    DEFAULT_VALUES = globals().get("DEFAULT_VALUES", {
-        "gauge_green_min": 0, "gauge_green_max": 20,
-        "gauge_yellow_min": 20, "gauge_yellow_max": 50,
-        "gauge_red_min": 50, "gauge_red_max": 100,
-        "graph_size": 20, "sigma_threshold": 120,
-    })
+        # Scenario 2 — delay above Δt_i and neighbors available
+        # (1) Imputed value within range & neighbors within range
+        "SCENARIO_2_IMPUTED_OK": (
+            "✅ Imputation completed for sensor {sid} at {ts}. "
+             ),
+        # (2) Imputed value outside acceptable range
+        "SCENARIO_2_IMPUTED_OOR": (
+            "⚠️ Imputation out of range for sensor {sid} at {ts}. "
+            "The reconstructed value violates domain constraints. Please review."
+        ),
+        # (3) Imputed value within range, but at least one neighbor is out of range
+        "SCENARIO_2_NEIGHBOR_MISMATCH": (
+            "🚨 Potential anomaly near sensor {sid} at {ts}. "
+            "The imputed value is within range, but one or more neighboring stations are out of range. "
+        ),
 
+        # Scenario 3 — delay above Δt_i and neighbors unavailable
+        # Historical imputation is possible
+        "SCENARIO_3_HIST_IMPUTE": (
+            "ℹ️ Neighbor data unavailable. Imputed {sid} at {ts} using historical patterns. "
+            "Monitor closely until live data resumes."
+        ),
+        # No reliable estimate possible
+        "SCENARIO_3_NO_ESTIMATE": (
+            "🚨 No reliable estimate for sensor {sid} at {ts}. "
+            "Target and neighboring stations are missing. Possible sensor or system fault."
+        ),
+    }
+
+    # Optional: short labels (if you show badges/toasts)
+    ALERT_SHORT = {
+        "WAIT": "Waiting for late data",
+        "OK": "Imputed (within range)",
+        "OOR": "Imputed (out of range)",
+        "NB_MISMATCH": "Neighbor inconsistency",
+        "HIST": "Imputed from history",
+        "NO_EST": "No reliable estimate",
+    }
+
+    if "_alert_ph" not in SS:
+        SS["_alert_ph"] = st.empty()
+
+    # ---------- small helpers ----------
     def init_once(key, val):
-        if key not in SS: SS[key] = val
+        if key not in SS:
+            SS[key] = val
         return SS[key]
 
-    def zpad6(s: str) -> str: return s if not str(s).isdigit() else str(s).zfill(6)
+    def zpad6(s: str) -> str:
+        return s if not s.isdigit() else s.zfill(6)
+
     def strip0(s: str) -> str:
-        t = str(s).lstrip("0"); return t if t else "0"
+        t = s.lstrip("0")
+        return t if t else "0"
 
-    def positions_to_df_safe(pos):
-        try: return positions_to_df(pos)  # ta version si dispo
-        except Exception: pass
-        if isinstance(pos, pd.DataFrame):
-            cols = {c.lower(): c for c in pos.columns}
-            lat = cols.get("latitude") or cols.get("lat")
-            lon = cols.get("longitude") or cols.get("lon") or cols.get("lng")
-            sid = cols.get("sensor_id") or cols.get("id") or cols.get("name")
-            if not (sid and lat and lon): raise ValueError("positions DF must have sensor_id/latitude/longitude")
-            out = pos.rename(columns={sid:"sensor_id", lat:"latitude", lon:"longitude"}).copy()
-            return out[["sensor_id","latitude","longitude"]]
-        raise ValueError("Unsupported positions type")
+    GREEN = [46, 204, 113, 200]
+    RED   = [231, 76, 60, 200]
 
-    def ensure_datetime_column(df: pd.DataFrame, name: str) -> pd.DataFrame:
-        if "datetime" in df.columns: return df
-        if isinstance(df.index, pd.DatetimeIndex):
-            return df.reset_index().rename(columns={"index":"datetime"})
-        for alt in ("timestamp","date","time"):
-            if alt in df.columns: return df.rename(columns={alt:"datetime"})
-        idx_as_dt = pd.to_datetime(df.index, errors="coerce")
-        if idx_as_dt.notna().all():
-            out = df.reset_index().rename(columns={"index":"datetime"})
-            out["datetime"] = idx_as_dt
-            return out
-        raise KeyError(f"{name} has no 'datetime' column or datetime-like index.")
+    def make_bg_layer(df):
+        return pdk.Layer(
+            "ScatterplotLayer",
+            data=df,
+            get_position=["longitude", "latitude"],
+            get_fill_color="bg_color",
+            get_radius="bg_radius",
+            radius_scale=1,
+            radius_min_pixels=6,
+            radius_max_pixels=22,
+            stroked=True,
+            get_line_color=[255, 255, 255, 180],
+            line_width_min_pixels=1,
+            pickable=False,
+        )
 
-    def lightify_safe(fig):
-        try: lightify(fig)  # ta skin
-        except Exception: pass
+    def make_icon_layer(df):
+        return pdk.Layer(
+            "IconLayer",
+            data=df,
+            get_icon="icon",
+            get_position=["longitude", "latitude"],
+            get_size="icon_size",
+            size_scale=8,
+            size_min_pixels=14,
+            size_max_pixels=28,
+            pickable=True,
+        )
 
-    # -------------------- Notifications “Facebook” (haut-gauche) --------------------
-    SS.setdefault("_notif_items", [])
-    init_once("alerts_armed", False)
+    def fit_view_simple(df: pd.DataFrame, padding_deg=0.02) -> pdk.ViewState:
+        if df is None or df.empty:
+            return pdk.ViewState(latitude=0, longitude=0, zoom=2, bearing=0, pitch=0)
+        lat_min = float(df["latitude"].min());  lat_max = float(df["latitude"].max())
+        lon_min = float(df["longitude"].min()); lon_max = float(df["longitude"].max())
+        lat_c = (lat_min + lat_max) / 2.0
+        lon_c = (lon_min + lon_max) / 2.0
+        span = max(lat_max - lat_min, lon_max - lon_min) + padding_deg
+        span = max(span, 1e-3)
+        zoom = max(1.0, min(16.0, np.log2(360.0 / span)))
+        return pdk.ViewState(latitude=lat_c, longitude=lon_c, zoom=zoom, bearing=0, pitch=0)
 
-    def _render_left_notifs_component():
-        import time as _t
-        now = _t.time()
-        SS["_notif_items"] = [n for n in SS["_notif_items"] if n.get("until", now) > now]
-        icons = {"info":"ℹ️","success":"✅","warning":"⚠️","error":"⛔"}
-        items = []
-        for n in SS["_notif_items"][-10:]:
-            items.append(f"""
-            <div class="tsg-left-notif {n['level']}">
-              <div class="tsg-icon">{icons.get(n['level'],'🔹')}</div>
-              <div class="tsg-body"><div>{n['text']}</div><div class="tsg-ts">{n['ts']}</div></div>
-            </div>""")
-        css = """
-        <style>
-          .tsg-root { position: fixed; top: 12px; left: 12px; width: 320px; z-index: 10000; pointer-events: none; }
-          .tsg-left-notif { background: rgba(33,33,33,.92); color:#fff; border-radius:10px; padding:10px 12px; margin:6px 0;
-                            box-shadow:0 6px 18px rgba(0,0,0,.25); display:flex; gap:8px; align-items:flex-start; }
-          .tsg-left-notif.info    { border-left:4px solid #3498db; }
-          .tsg-left-notif.success { border-left:4px solid #2ecc71; }
-          .tsg-left-notif.warning { border-left:4px solid #f1c40f; }
-          .tsg-left-notif.error   { border-left:4px solid #e74c3c; }
-          .tsg-icon { width:18px; }
-          .tsg-body { flex:1; }
-          .tsg-ts { font-size:11px; opacity:.8; margin-top:2px; }
-          html,body{ background:transparent; margin:0; padding:0; }
-        </style>"""
-        html = f"<!doctype html><html><head>{css}</head><body><div class='tsg-root'>{''.join(items)}</div></body></html>"
-        st_html(html, height=1, scrolling=False)
-
-    class NotificationCenter:
-        def __init__(self): self.seen = SS.setdefault("_notifs_seen", set())
-        def push(self, level, title, text, ts, ttl=6.0, key=None):
-            k = key or f"{level}:{title}:{text}:{str(ts)[:13]}"
-            if k in self.seen: return
-            self.seen.add(k)
-            import time as _t
-            SS["_notif_items"].append({"level":level,"text":f"<b>{title}</b> — {text}",
-                                       "ts": str(ts), "until": _t.time()+float(ttl)})
-            _render_left_notifs_component()
-
-    NOTIF = NotificationCenter()
-    def n_info(ti, tx, ts, key=None): NOTIF.push("info","Awaiting late data" if "Awaiting" in ti else ti, tx, ts, key=key)
-    def n_ok(ti, tx, ts, key=None):   NOTIF.push("success", ti, tx, ts, key=key)
-    def n_warn(ti, tx, ts, key=None): NOTIF.push("warning", ti, tx, ts, key=key)
-    def n_err(ti, tx, ts, key=None):  NOTIF.push("error", ti, tx, ts, key=key)
-
-    # -------------------- Contraintes (spatial/temporal) --------------------
-    constraints_list = SS.get("constraints", []) or []
-    spatial_cfg = None
-    temporal_cfgs = []
-    for c in constraints_list:
-        if c.get("type") == "Spatial": spatial_cfg = c
-        elif c.get("type") == "Temporal": temporal_cfgs.append(c)
-
-    MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"]
-    def month_name(ts: pd.Timestamp) -> str:
-        try: return MONTHS[int(ts.month)-1]
-        except: return ""
-
-    def haversine_km(lat1, lon1, lat2, lon2):
-        R = 6371.0
-        φ1, φ2 = math.radians(lat1), math.radians(lat2)
-        dφ, dλ = math.radians(lat2-lat1), math.radians(lon2-lon1)
-        a = math.sin(dφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(dλ/2)**2
-        return 2*R*math.asin(math.sqrt(a))
-
-    def temporal_ok(ts: pd.Timestamp, val) -> (bool, str|None):
-        if val is None or (isinstance(val,float) and np.isnan(val)): return False, "no value"
-        mname = month_name(ts)
-        rules = [c for c in temporal_cfgs if c.get("month")==mname]
-        if not rules: return True, None
-        v = float(val)
-        for r in rules:
-            opt = (r.get("constraint_option") or r.get("option") or "").lower()
-            thr = float(r.get("temp_threshold", np.nan))
-            if np.isnan(thr): continue
-            if "greater" in opt and not (v > thr): return False, f"{mname}: {v:.2f} !> {thr}"
-            if "less"    in opt and not (v < thr): return False, f"{mname}: {v:.2f} !< {thr}"
-        return True, None
-
-    def spatial_ok(sensor_id: str, ts: pd.Timestamp, val, latlng_df: pd.DataFrame, values_row: dict) -> (bool, list[str]):
-        if spatial_cfg is None or val is None or (isinstance(val,float) and np.isnan(val)): return True, []
-        max_km  = float(spatial_cfg.get("distance in km", 0)) or 0.0
-        max_diff = float(spatial_cfg.get("diff", 0)) if spatial_cfg.get("diff") is not None else 0.0
-        if max_km <= 0 or max_diff <= 0: return True, []
-        row = latlng_df.loc[latlng_df["data_col"] == sensor_id]
-        if row.empty: return True, []
-        lat_s, lon_s = float(row.iloc[0]["latitude"]), float(row.iloc[0]["longitude"])
-        bad = []
-        for _, nb in latlng_df.iterrows():
-            nb_id = nb["data_col"]
-            if nb_id == sensor_id: continue
-            dkm = haversine_km(lat_s, lon_s, float(nb["latitude"]), float(nb["longitude"]))
-            if dkm <= max_km + 1e-9:
-                nb_val = values_row.get(nb_id, np.nan)
-                if nb_val is None or (isinstance(nb_val,float) and np.isnan(nb_val)): continue
-                if abs(float(val)-float(nb_val)) > max_diff:
-                    bad.append(f"{nb_id} (Δ={abs(float(val)-float(nb_val)):.2f} > {max_diff}, {dkm:.2f} km)")
-        return (len(bad)==0), bad
-
-    # -------------------- Sélection / positions --------------------
+    # ---------- select sensors for map/TS/snapshot10 ----------
     all_sensor_cols = [c for c in sim_df.columns if c != "datetime"]
     graph_size = int(SS.get("graph_size", DEFAULT_VALUES["graph_size"]))
     sensor_cols = [str(c) for c in all_sensor_cols[:graph_size]]
     col_to_idx = {c: i for i, c in enumerate(sensor_cols)}
 
-    latlng_raw = positions_to_df_safe(positions).copy()
+    # ---------- positions ----------
+    latlng_raw = positions_to_df(positions).copy()
     latlng_raw["sensor_id"] = latlng_raw["sensor_id"].astype(str).str.strip()
     latlng_raw["latitude"]  = pd.to_numeric(latlng_raw["latitude"],  errors="coerce")
     latlng_raw["longitude"] = pd.to_numeric(latlng_raw["longitude"], errors="coerce")
-    latlng_raw = latlng_raw.dropna(subset=["latitude","longitude"]).reset_index(drop=True)
+    latlng_raw = latlng_raw.dropna(subset=["latitude", "longitude"])
     pos_ids = latlng_raw["sensor_id"].tolist()
 
     map_exact  = {pid: pid for pid in pos_ids if pid in sensor_cols}
@@ -1997,14 +2077,18 @@ def run_simulation_with_live_imputation(
         if s in sensor_cols: map_strip0[pid] = s
         elif s6 in sensor_cols: map_strip0[pid] = s6
     map_index = {}
-    if all(str(p).isdigit() for p in pos_ids):
+    if all(p.isdigit() for p in pos_ids):
         nums = sorted(int(p) for p in pos_ids)
-        if nums and nums[0]==0 and nums[-1]==len(nums)-1:
+        if nums and nums[0] == 0 and nums[-1] == len(nums) - 1:
             for i, pid in enumerate(sorted(pos_ids, key=lambda x: int(x))):
-                if i < len(sensor_cols): map_index[pid] = sensor_cols[i]
+                if i < len(sensor_cols):
+                    map_index[pid] = sensor_cols[i]
 
-    best_map = max([map_exact, map_pad6, map_strip0, map_index], key=lambda m: len(m))
-    if len(best_map) == 0: st.info("No matching positions for selected sensors."); return
+    candidates = [map_exact, map_pad6, map_strip0, map_index]
+    best_map = max(candidates, key=lambda m: len(m))
+    if len(best_map) == 0:
+        st.info("No matching positions for selected sensors.")
+        return
 
     latlng = latlng_raw.copy()
     latlng["data_col"] = latlng["sensor_id"].map(best_map)
@@ -2013,18 +2097,39 @@ def run_simulation_with_live_imputation(
     latlng["__ord"] = latlng["data_col"].map(order_index)
     latlng = latlng.sort_values("__ord").drop(columns="__ord").reset_index(drop=True)
     sensor_cols = [c for c in sensor_cols if c in set(latlng["data_col"])]
-    if not sensor_cols: st.info("After mapping, no sensors remain to plot."); return
+    if not sensor_cols:
+        st.info("After mapping, no sensors remain to plot.")
+        return
     col_to_idx = {c: i for i, c in enumerate(sensor_cols)}
 
-    # -------------------- Temps / alignement --------------------
+    # ---------- time alignment ----------
+    def ensure_datetime_column(df: pd.DataFrame, name: str) -> pd.DataFrame:
+        if "datetime" in df.columns:
+            return df
+        if isinstance(df.index, pd.DatetimeIndex):
+            return df.reset_index().rename(columns={"index": "datetime"})
+        for alt in ("timestamp", "date", "time"):
+            if alt in df.columns:
+                return df.rename(columns={alt: "datetime"})
+        idx_as_dt = pd.to_datetime(df.index, errors="coerce")
+        if idx_as_dt.notna().all():
+            out = df.reset_index().rename(columns={"index": "datetime"})
+            out["datetime"] = idx_as_dt
+            return out
+        raise KeyError(f"{name} has no 'datetime' column or datetime-like index.")
+
     sim_df     = ensure_datetime_column(sim_df, "sim_df")
     missing_df = ensure_datetime_column(missing_df, "missing_df")
-    sim_df["datetime"]     = pd.to_datetime(sim_df["datetime"], errors="coerce").dt.floor("h")
-    missing_df["datetime"] = pd.to_datetime(missing_df["datetime"], errors="coerce").dt.floor("h")
-    sim_df     = sim_df.dropna(subset=["datetime"]).drop_duplicates(subset=["datetime"])
-    missing_df = missing_df.dropna(subset=["datetime"]).drop_duplicates(subset=["datetime"])
+    sim_df["datetime"]     = pd.to_datetime(sim_df["datetime"], errors="coerce")
+    missing_df["datetime"] = pd.to_datetime(missing_df["datetime"], errors="coerce")
+    sim_df     = sim_df.dropna(subset=["datetime"]).copy()
+    missing_df = missing_df.dropna(subset=["datetime"]).copy()
+    sim_df["datetime"]     = sim_df["datetime"].dt.floor("h")
+    missing_df["datetime"] = missing_df["datetime"].dt.floor("h")
     sim_df.set_index("datetime", inplace=True)
     missing_df.set_index("datetime", inplace=True)
+    sim_df     = sim_df[~sim_df.index.duplicated(keep="first")].copy()
+    missing_df = missing_df[~missing_df.index.duplicated(keep="first")].copy()
 
     if "orig_missing_baseline" not in SS:
         SS.orig_missing_baseline = missing_df.isna().copy()
@@ -2032,74 +2137,84 @@ def run_simulation_with_live_imputation(
         if (not SS.orig_missing_baseline.index.equals(missing_df.index) or
             list(SS.orig_missing_baseline.columns) != list(missing_df.columns)):
             SS.orig_missing_baseline = missing_df.isna().copy()
+
+    # >>> ADD (freeze the original values so PriSTI plots can show originals)
     if "orig_missing_values" not in SS:
         SS.orig_missing_values = missing_df.copy()
+    # <<< END ADD
 
-    common_index = missing_df.index
-    if common_index.empty or latlng.empty: st.info("No matching timeline or positions/sensors."); return
+    base_index   = missing_df.index
+    sim_df       = sim_df.reindex(base_index)
+    common_index = base_index
+    if common_index.empty or latlng.empty:
+        st.info("No matching timeline or positions/sensors.")
+        return
 
-    # -------------------- États persistants --------------------
+    # ---------- persistent state ----------
     uid = init_once("sim_uid", f"sim_{uuid.uuid4().hex[:8]}")
     init_once("sim_iter", 0)
-    init_once("sim_ptr", 0)
+    init_once("sim_ptr", 0)  # position dans la timeline
+    if "imputed_mask" not in SS:
+        SS.imputed_mask = pd.DataFrame(False, index=common_index, columns=sensor_cols, dtype=bool)
+    SS.imputed_mask = SS.imputed_mask.reindex(index=common_index, columns=sensor_cols, fill_value=False)
+
     init_once("sliding_window_df", pd.DataFrame(columns=["datetime"] + list(sensor_cols)))
     init_once("global_df", pd.DataFrame(columns=["datetime"] + list(sensor_cols)))
-    if "_missing_streak_hours" not in SS:
-        SS["_missing_streak_hours"] = {c: 0.0 for c in sensor_cols}
-    else:
-        for c in sensor_cols: SS["_missing_streak_hours"].setdefault(c, 0.0)
-    if "_prev_baseline_missing" not in SS:
-        SS["_prev_baseline_missing"] = {c: None for c in sensor_cols}
+    init_once("impute_time_tsg", {})  # per-timestamp seconds
+    init_once("impute_time_pri", {})
 
-    # -------------------- UI (identique) --------------------
+
+
+
+    # ---------- UI (created once) ----------
     if "_ui_inited" not in SS:
         SS["_ui_inited"] = True
+
+        # Row 1: two columns: left (title, time, button, map) | right (gauge)
         col_left, col_right = st.columns([3, 1], gap="small")
+
         with col_left:
             st.markdown("### Sensor Visualization")
             hdr_l, hdr_r = st.columns([5, 2], gap="small")
-            with hdr_l: SS["ph_time"] = st.markdown("**Current Time:** —")
-            with hdr_r: SS["ph_fitbtn"] = st.empty()
+            with hdr_l:
+                SS["ph_time"] = st.markdown("**Current Time:** —")
+            with hdr_r:
+                SS["ph_fitbtn"] = st.empty()     # we render the button each run below
+
+            # map placeholder lives in the left column
             SS["ph_map"] = st.empty()
+
         with col_right:
-            st.markdown("<div style='text-align:center;font-weight:700;margin:0.25rem 0'>Data Quality & Activity</div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div style='text-align:center;font-weight:700;margin:0.25rem 0'>Data Quality & Activity</div>",
+                unsafe_allow_html=True
+            )
             SS["ph_counts_active"]  = st.empty()
             SS["ph_counts_missing"] = st.empty()
             SS["ph_gauge"] = st.empty()
-        st.markdown("---")
-        row2_l, row2_r = st.columns([3, 2], gap="small")
-        with row2_l: SS["ph_global"] = st.empty()
-        with row2_r: SS["ph_snap10"] = st.empty()
+
         st.markdown("---")
 
+        # Row 2: Global TS (left) + snapshot-10 (right)
+        row2_l, row2_r = st.columns([3, 2], gap="small")
+        with row2_l:
+            SS["ph_global"] = st.empty()
+        with row2_r:
+            SS["ph_snap10"] = st.empty()
+
+        st.markdown("---")
+
+
+    # Render a single Fit button (in left header, aligned right)
     with SS["ph_fitbtn"]:
+        # unique, stable key
         if st.button("Fit map to sensors", use_container_width=True, key=f"{uid}_fitbtn"):
             SS["_fit_event"] = True
 
-    # -------------------- deck.gl --------------------
-    GREEN  = [46,204,113,200]; AMBER = [241,196,15,200]; RED = [231,76,60,200]
-    # global ICON_SPEC
-    # if "ICON_SPEC" not in globals() or ICON_SPEC is None:
-    #     ICON_SPEC = {"url": "", "width": 1, "height": 1, "anchorX": 0, "anchorY": 0}
-    def make_bg_layer(df):
-        return pdk.Layer("ScatterplotLayer", data=df,
-                         get_position=["longitude","latitude"],
-                         get_fill_color="bg_color", get_radius="bg_radius",
-                         radius_scale=1, radius_min_pixels=6, radius_max_pixels=22,
-                         stroked=True, get_line_color=[255,255,255,180], line_width_min_pixels=1,
-                         pickable=False)
-    def make_icon_layer(df):
-        return pdk.Layer("IconLayer", data=df, get_icon="icon",
-                         get_position=["longitude","latitude"], get_size="icon_size",
-                         size_scale=8, size_min_pixels=14, size_max_pixels=28, pickable=True)
-    def fit_view_simple(df: pd.DataFrame, padding_deg=0.02) -> pdk.ViewState:
-        if df is None or df.empty: return pdk.ViewState(latitude=0, longitude=0, zoom=2, bearing=0, pitch=0)
-        lat_min = float(df["latitude"].min());  lat_max = float(df["latitude"].max())
-        lon_min = float(df["longitude"].min()); lon_max = float(df["longitude"].max())
-        lat_c = (lat_min+lat_max)/2.0; lon_c = (lon_min+lon_max)/2.0
-        span = max(lat_max-lat_min, lon_max-lon_min) + padding_deg; span = max(span, 1e-3)
-        zoom = max(1.0, min(16.0, np.log2(360.0/span)))
-        return pdk.ViewState(latitude=lat_c, longitude=lon_c, zoom=zoom, bearing=0, pitch=0)
+    # ---------- deck.gl persistent ----------
+    global ICON_SPEC
+    if "ICON_SPEC" not in globals() or ICON_SPEC is None:
+        ICON_SPEC = {"url": "", "width": 1, "height": 1, "anchorX": 0, "anchorY": 0}
 
     if "deck_obj" not in SS:
         base_df = latlng.copy()
@@ -2108,7 +2223,7 @@ def run_simulation_with_live_imputation(
         base_df["status"] = "Predicted"
         base_df["bg_color"] = [[231, 76, 60, 200] for _ in range(len(base_df))]
         base_df["bg_radius"] = 10
-        base_df["icon"] = [ICON_SPEC] * len(base_df)  # ← utilise l'instance stateful
+        base_df["icon"] = [ICON_SPEC] * len(base_df)
         base_df["icon_size"] = 1.0
 
         init_view = fit_view_simple(base_df)
@@ -2121,62 +2236,65 @@ def run_simulation_with_live_imputation(
         )
         SS["_fit_base_df"] = base_df.copy()
 
+    # Handle Fit event: REBUILD the deck with a NEW view state, then re-render
     if SS.get("_fit_event", False):
         df_to_fit = SS.get("_fit_base_df", latlng)
         new_view = fit_view_simple(df_to_fit)
-        SS.deck_obj = pdk.Deck(layers=SS.deck_obj.layers, initial_view_state=new_view,
-                               map_style=getattr(SS.deck_obj,"map_style","mapbox://styles/mapbox/light-v11"),
-                               tooltip=SS.get("deck_tooltip", {"text":"Sensor {sensor_id}\nValue: {value}\nStatus: {status}"}))
+        layers = SS.deck_obj.layers
+        # rebuild deck to force refit
+        SS.deck_obj = pdk.Deck(
+            layers=layers,
+            initial_view_state=new_view,
+            map_style=getattr(SS.deck_obj, "map_style", "mapbox://styles/mapbox/light-v11"),
+            tooltip=SS.get("deck_tooltip", {"text": "Sensor {sensor_id}\nValue: {value}\nStatus: {status}"}),
+        )
+        SS["ph_map"].pydeck_chart(SS.deck_obj, use_container_width=True)
         SS["_fit_event"] = False
-    SS["ph_map"].pydeck_chart(SS.deck_obj, use_container_width=True)
-    _render_left_notifs_component()
 
-    # -------------------- Palette PLOTS --------------------
-    base_palette = ["#000000","#003366","#009999","#006600","#66CC66","#FF9933","#FFD700","#708090","#4682B4","#99FF33"]
+    # Initial map draw (if not drawn by fit)
+    SS["ph_map"].pydeck_chart(SS.deck_obj, use_container_width=True)
+
+    # ---------- palettes ----------
+    base_palette = ["#000000", "#003366", "#009999", "#006600", "#66CC66",
+                    "#FF9933", "#FFD700", "#708090", "#4682B4", "#99FF33"]
     sensor_color_map = {c: base_palette[i % len(base_palette)] for i, c in enumerate(sensor_cols)}
 
-    # -------------------- Modèle --------------------
+
+    # add a place to show alerts (non-intrusive)
+    if "ph_alerts" not in SS:
+        SS["ph_alerts"] = st.empty()
+
+    # missing-streak tracker (by data_col) for scenario 1 thresholding
+    if "_missing_streak_hours" not in SS:
+        SS["_missing_streak_hours"] = {c: 0 for c in sensor_cols}
+    else:
+        # keep in sync with current selection
+        for c in sensor_cols:
+            SS["_missing_streak_hours"].setdefault(c, 0)
+
+    # ---------- main loop (resume from pointer) ----------
     use_model = model is not None
     if use_model:
-        try: model.eval()
-        except Exception: pass
+        model.eval()
 
-    # -------------------- Δtᵢ --------------------
-    sigma_minutes = SS.get("sigma_threshold", DEFAULT_VALUES["sigma_threshold"])
-    DELTA_HOURS = float(sigma_minutes) / 60.0
-
-    # -------------------- Mask builder (pour PLOTS) --------------------
-    def build_imputed_mask_from_store(missing_df: pd.DataFrame,
-                                      baseline_missing: pd.DataFrame,
-                                      sensor_cols: list[str]) -> pd.DataFrame:
-        base = baseline_missing.reindex(index=missing_df.index, columns=sensor_cols, fill_value=False).astype(bool)
-        now_has_val = missing_df.reindex(columns=sensor_cols).notna()
-        return (base & now_has_val).astype(bool)
-
-    # -------------------- Fallback prédicteur --------------------
-    def predict_single_missing_value_fallback(historical_window, target_sensor_index, **kwargs):
-        try:
-            col = int(target_sensor_index)
-            col_series = pd.Series(historical_window[:, col])
-            col_series = pd.to_numeric(col_series, errors="coerce").dropna()
-            return float(col_series.iloc[-1]) if not col_series.empty else np.nan
-        except Exception:
-            return np.nan
-
-    # -------------------- LOOP --------------------
     SNAP10 = 10
     ptr = int(SS["sim_ptr"])
     total_steps = len(common_index)
 
+
+    # # with st.expander("🔔 Alerts (dismissible)", expanded=True):
+    # render_alert_center(12)
+
     while ptr < total_steps:
         ts = pd.Timestamp(common_index[ptr])
-        SS["sim_iter"] = SS.get("sim_iter", 0) + 1
+        SS["sim_iter"] += 1
         iter_key = SS["sim_iter"]
-        SS["ph_time"].markdown(f"<div style='font-weight:600'>Current Time: {ts}</div>", unsafe_allow_html=True)
-
         baseline_row_ts = SS.orig_missing_baseline.reindex(index=[ts], columns=sensor_cols).iloc[0]
 
-        # Fenêtre historique < ts
+        # time label
+        SS["ph_time"].markdown(f"<div style='font-weight:600'>Current Time: {ts}</div>", unsafe_allow_html=True)
+
+        # history window strictly before ts
         hist_end = ts - pd.Timedelta(hours=1)
         if hist_end in missing_df.index:
             hist_idx = missing_df.loc[:hist_end].index[-window_hours:]
@@ -2184,30 +2302,22 @@ def run_simulation_with_live_imputation(
             hist_idx = missing_df.index[missing_df.index < ts][-window_hours:]
         hist_win = missing_df.loc[hist_idx, sensor_cols] if len(hist_idx) > 0 else pd.DataFrame()
 
-        # --- Imputation avec attente Δtᵢ ---
-        svals, status = [], []  # status: "Real" | "Delayed" | "Predicted"
+        # --- TSGuard imputation (alignée baseline) ---
+        tsg_start = time.perf_counter()
+        baseline_row_ts = SS.orig_missing_baseline.reindex(index=[ts], columns=sensor_cols).iloc[0]
+
+        svals, sstatus = [], []
+
         for col in sensor_cols:
-            originally_missing = bool(baseline_row_ts.get(col, False))
-            val_now = np.nan
+            is_missing_now = bool(baseline_row_ts.get(col, False))
 
-            if originally_missing:
-                # streak / délai
-                SS["_missing_streak_hours"][col] = SS["_missing_streak_hours"].get(col, 0.0) + 1.0
-                delay_h = SS["_missing_streak_hours"][col]
+            if is_missing_now:
+                pred_val = np.nan
 
-                if delay_h < DELTA_HOURS:
-                    # S1: attendre (ne pas imputer)
-                    status.append("Delayed")
-                    svals.append(np.nan)
-                    if SS.get("alerts_armed", False):
-                        n_info("Awaiting late data", f"Sensor {col}: missing for {int(delay_h)}h (Δt={DELTA_HOURS:.1f}h).", ts,
-                              key=f"s1:{col}:{int(delay_h)}")
-                else:
-                    # S2/S3: tenter d’imputer
-                    pred_val = np.nan
-                    if use_model and not hist_win.empty:
+                if not hist_win.empty:
+                    if use_model:
                         try:
-                            pred_val = predict_single_missing_value(   # ta fonction si dispo
+                            pred_val = predict_single_missing_value(
                                 historical_window=np.asarray(hist_win.values, dtype=np.float32),
                                 target_sensor_index=col_to_idx[col],
                                 model=model, scaler=scaler, inv_scaler=inv_scaler, device=device
@@ -2215,153 +2325,168 @@ def run_simulation_with_live_imputation(
                         except Exception:
                             pred_val = np.nan
                     if (not np.isfinite(pred_val)) or pd.isna(pred_val):
-                        pred_val = predict_single_missing_value_fallback(
-                            historical_window=np.asarray(hist_win.values, dtype=np.float32) if not hist_win.empty else np.empty((0, len(sensor_cols))),
-                            target_sensor_index=col_to_idx[col]
-                        )
+                        # fallback: dernier réel dans l'historique
+                        last = pd.to_numeric(hist_win[col].dropna(), errors="coerce")
+                        pred_val = float(last.iloc[-1]) if len(last) else np.nan
 
-                    if np.isfinite(pred_val) and not pd.isna(pred_val):
-                        try: missing_df.at[ts, col] = float(pred_val)
-                        except Exception: pass
-                        status.append("Predicted")
-                        svals.append(float(pred_val))
-
-                        # Contraintes
-                        ok_t, msg_t = temporal_ok(ts, pred_val)
-                        # Prépare la ligne des voisins au même ts
-                        row_vals = {c: (missing_df.at[ts, c] if (ts in missing_df.index and c in missing_df.columns) else np.nan) for c in sensor_cols}
-                        row_vals[col] = pred_val
-                        ok_s, bad_neighbors = spatial_ok(col, ts, pred_val, latlng, row_vals)
-
-                        if SS.get("alerts_armed", False):
-                            if (not ok_t) and msg_t:
-                                n_err("Real-time alert", f"Sensor {col}: temporal constraint failed — {msg_t}.", ts)
-                            elif (not ok_s) and bad_neighbors:
-                                n_err("Real-time alert", f"Sensor {col}: spatial inconsistency → {', '.join(bad_neighbors[:5])}{'…' if len(bad_neighbors)>5 else ''}.", ts)
-                            else:
-                                n_ok("Imputation completed", f"Sensor {col}: reconstructed; plausibility OK.", ts)
-                    else:
-                        # S3: aucune estimation fiable
-                        status.append("Delayed")
-                        svals.append(np.nan)
-                        if SS.get("alerts_armed", False):
-                            n_err("System/Sensor fault?", f"Sensor {col}: no reliable estimate from historical patterns.", ts)
-            else:
-                # Donnée réelle présente à l'origine
-                SS["_missing_streak_hours"][col] = 0.0
+                # write + flags
                 try:
-                    val_now = missing_df.at[ts, col]
+                    missing_df.at[ts, col] = pred_val if pd.notna(pred_val) else np.nan
                 except Exception:
-                    val_now = np.nan
-                svals.append(val_now)
-                status.append("Real")
+                    pass
+                svals.append(pred_val)
+                sstatus.append(False)                     # imputé (rouge sur la map)
+                SS.imputed_mask.at[ts, col] = pd.notna(pred_val)
 
-                # Restauration si précédemment “missing”
-                prev = SS["_prev_baseline_missing"].get(col, None)
-                if SS.get("alerts_armed", False) and prev is True:
-                    n_ok("Data restored", f"Sensor {col}: telemetry available at {ts}.", ts)
+            else:
+                # présent à l'origine → garder la valeur
+                v = missing_df.at[ts, col] if (ts in missing_df.index and col in missing_df.columns) else np.nan
+                svals.append(v)
+                sstatus.append(True)                      # réel (vert sur la map)
+                SS.imputed_mask.at[ts, col] = False
 
-            SS["_prev_baseline_missing"][col] = originally_missing
+        SS["impute_time_tsg"][ts] = time.perf_counter() - tsg_start
 
-        # --- Buffers rendu (sliding & global) ---
+        # Sécurité : parité des tailles
+        if len(svals)   < len(sensor_cols): svals   += [np.nan] * (len(sensor_cols) - len(svals))
+        if len(sstatus) < len(sensor_cols): sstatus += [False]  * (len(sensor_cols) - len(sstatus))
+
+        # ---- Dicts capteur -> valeur/état ----
+        vals_by_col = dict(zip(sensor_cols, svals))
+        real_by_col = dict(zip(sensor_cols, sstatus))
+        imputed_row = SS.imputed_mask.reindex(index=[ts], columns=sensor_cols, fill_value=False).iloc[0]
+
+        # --- Update missing streak (Scénario 1) ---
+        if "_missing_streak_hours" not in SS:
+            SS["_missing_streak_hours"] = {c: 0.0 for c in sensor_cols}
+
+        for c in sensor_cols:
+            originally_missing = bool(baseline_row_ts.get(c, False))
+            val_now = vals_by_col.get(c, np.nan)
+            no_value_now = (val_now is None) or (isinstance(val_now, float) and np.isnan(val_now))
+            # On incrémente uniquement quand il manquait à l’origine ET qu’on n’a toujours pas de valeur à afficher
+            if originally_missing and no_value_now:
+                SS["_missing_streak_hours"][c] = SS["_missing_streak_hours"].get(c, 0.0) + 1.0  # +1h par tick
+            else:
+                SS["_missing_streak_hours"][c] = 0.0
+
+        # ---- Vérification des contraintes & alertes (appelle TA fonction) ----
+        verify_constraints_and_alerts_for_timestamp(
+            ts=ts,
+            latlng_df=latlng[["sensor_id", "data_col", "latitude", "longitude"]],
+            values_by_col=vals_by_col,
+            imputed_mask_row=imputed_row,
+            baseline_row=baseline_row_ts,
+        )
+        # à la fin de CHAQUE itération (après la vérif des contraintes et les push_alert)
+        render_grouped_alerts()
+
+        # ---- Buffers de rendu (inchangé) ----
         row = {"datetime": ts}
-        for i, c in enumerate(sensor_cols): row[c] = svals[i]
+        for i, c in enumerate(sensor_cols):
+            row[c] = svals[i]
         SS.sliding_window_df.loc[len(SS.sliding_window_df)] = row
         SS.global_df.loc[len(SS.global_df)] = row
-        if len(SS.sliding_window_df) > 36: SS.sliding_window_df = SS.sliding_window_df.tail(36)
+        if len(SS.sliding_window_df) > 36:
+            SS.sliding_window_df = SS.sliding_window_df.tail(36)
 
-        # --- Carte (JAUNE < Δtᵢ, ROUGE ≥ Δtᵢ ou Predicted) ---
-        tick_df = latlng.copy()
+
+        # --- Map update & store base for next Fit ---
+        # --- juste avant la mise à jour de la carte ---
+        # (garde les mêmes noms de variables que ton code)
+        if len(svals) != len(sensor_cols) or len(sstatus) != len(sensor_cols):
+            if not st.session_state.get("_warned_len_mismatch", False):
+                st.warning(
+                    f"[Guard] Mismatch tailles — sensors={len(sensor_cols)}, svals={len(svals)}, sstatus={len(sstatus)}. "
+                    "On complète seulement ce tick."
+                )
+                st.session_state["_warned_len_mismatch"] = True
+
+        # mapping sûr (pas d'IndexError); les capteurs sans valeur recevront NaN/False et la map affichera 'NA'
         vals_by_col = dict(zip(sensor_cols, svals))
-        status_by_col = dict(zip(sensor_cols, status))
-        def color_for(col):
-            stt = status_by_col.get(col, "Real")
-            if stt == "Real": return [46,204,113,200]           # vert
-            if stt == "Predicted": return [231,76,60,200]       # rouge
-            # Delayed: jaune si < Δtᵢ, rouge si >= Δtᵢ
-            delay_h = SS["_missing_streak_hours"].get(col, 0.0)
-            return [241,196,15,200] if delay_h < DELTA_HOURS else [231,76,60,200]
-
-        tick_df["value"] = tick_df["data_col"].map(vals_by_col).fillna("NA")
-        tick_df["status"] = tick_df["data_col"].map(lambda c: status_by_col.get(c, "Real"))
-        tick_df["bg_color"] = tick_df["data_col"].map(color_for)
+        real_by_col = dict(zip(sensor_cols, sstatus))
+        tick_df = latlng.copy()
+        tick_df["value"]  = tick_df["data_col"].map(vals_by_col).fillna("NA")
+        tick_df["status"] = tick_df["data_col"].map(lambda c: "Real" if real_by_col.get(c, False) else "Predicted")
+        tick_df["bg_color"] = [GREEN if s == "Real" else RED for s in tick_df["status"]]
         tick_df["bg_radius"] = 10
-
-        tick_df["icon"] = [ICON_SPEC] * len(tick_df)  # ← pas de global
+        tick_df["icon"] = [ICON_SPEC] * len(tick_df)
         tick_df["icon_size"] = 1.0
-
-        # fit éventuel
-        if SS.get("_fit_event", False):
-            new_view = fit_view_simple(tick_df)
-            SS.deck_obj = pdk.Deck(layers=[make_bg_layer(tick_df), make_icon_layer(tick_df)],
-                                   initial_view_state=new_view,
-                                   map_style="mapbox://styles/mapbox/light-v11",
-                                   tooltip=SS.get("deck_tooltip", {"text":"Sensor {sensor_id}\nValue: {value}\nStatus: {status}"}))
-            SS["_fit_event"] = False
-        else:
-            SS.deck_obj.layers = [make_bg_layer(tick_df), make_icon_layer(tick_df)]
+        SS.deck_obj.layers = [make_bg_layer(tick_df), make_icon_layer(tick_df)]
         SS["_fit_base_df"] = tick_df.copy()
         SS["ph_map"].pydeck_chart(SS.deck_obj, use_container_width=True)
-        _render_left_notifs_component()  # garde l’overlay vivant
 
-        # --- Gauge & compteurs ---
+        # --- Gauge & counts (CUMULATIVE MISSED from the beginning to now) ---
         baseline_mask_to_now = SS.orig_missing_baseline.loc[:ts, sensor_cols]
-        cumulative_missed = int(baseline_mask_to_now.values.sum())
+        cumulative_missed = int(baseline_mask_to_now.values.sum())  # total # of originally-missing cells up to ts
         total_cells_to_now = baseline_mask_to_now.size
         pct_missed_to_now = (cumulative_missed / total_cells_to_now * 100.0) if total_cells_to_now else 0.0
+
+        # Active sensors NOW (same as before, just for info)
+        row_imp = SS.imputed_mask.reindex(index=[ts], columns=sensor_cols, fill_value=False).iloc[0]
+        imputed_now = int(row_imp.sum())
+        sensors_total = max(1, len(sensor_cols))
+        real_now = sensors_total - imputed_now
+
+        # Per-timestamp (NOW) counts that match the map colors:
         missed_now = int(baseline_row_ts.sum())
         active_now = len(sensor_cols) - missed_now
+
         SS["ph_counts_active"].markdown(f"Active sensors now: **{active_now}**")
         SS["ph_counts_missing"].markdown(f"Delayed sensors now: **{missed_now}**")
 
+        # Gauge shows MISSED DATA (%) cumulatively
         gauge_fig = go.Figure(go.Indicator(
-            mode="gauge+number", value=pct_missed_to_now, title={"text":"Missed Data (%)"},
-            gauge={"axis":{"range":[0,100]},
-                   "bar":{"color":"red" if pct_missed_to_now >= DEFAULT_VALUES["gauge_red_max"] else "green"},
-                   "steps":[
-                       {"range":[DEFAULT_VALUES["gauge_green_min"],DEFAULT_VALUES["gauge_green_max"]], "color":"lightgreen"},
-                       {"range":[DEFAULT_VALUES["gauge_yellow_min"],DEFAULT_VALUES["gauge_yellow_max"]], "color":"yellow"},
-                       {"range":[DEFAULT_VALUES["gauge_red_min"],DEFAULT_VALUES["gauge_red_max"]], "color":"red"}]}))
-        gauge_fig.update_layout(title="", margin=dict(l=10,r=10,t=30,b=10))
-        lightify_safe(gauge_fig)
+            mode="gauge+number",
+            value=pct_missed_to_now,
+            title={"text": "Missed Data (%)"},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"color": "red" if pct_missed_to_now >= DEFAULT_VALUES["gauge_red_max"] else "green"},
+                "steps": [
+                    {"range": [DEFAULT_VALUES["gauge_green_min"], DEFAULT_VALUES["gauge_green_max"]],
+                     "color": "lightgreen"},
+                    {"range": [DEFAULT_VALUES["gauge_yellow_min"], DEFAULT_VALUES["gauge_yellow_max"]],
+                     "color": "yellow"},
+                    {"range": [DEFAULT_VALUES["gauge_red_min"], DEFAULT_VALUES["gauge_red_max"]], "color": "red"},
+                ],
+            },
+        ))
+        gauge_fig.update_layout(title="",margin=dict(l=10, r=10, t=30, b=10))
+        lightify(gauge_fig)
         SS["ph_gauge"].plotly_chart(gauge_fig, use_container_width=True, key=f"{uid}_gauge_{iter_key}")
 
-        # --- PLOTS (même logique que chez toi) ---
-        # masque reconstruit depuis la mémoire → segments rouges cohérents
-        mask_plot = build_imputed_mask_from_store(missing_df, SS.orig_missing_baseline, sensor_cols)
-
-        # Global TS
-        # (reindex pour coller à l’ordre temporel de global_df)
-        mask_for_global = mask_plot.reindex(index=pd.to_datetime(SS.global_df["datetime"]), columns=sensor_cols, fill_value=False)
-        full_ts_fig = draw_full_time_series_with_mask_gap(SS.global_df.copy(), mask_for_global, sensor_cols, sensor_color_map)
-        lightify_safe(full_ts_fig)
+        # --- Global TS ---
+        full_ts_fig = draw_full_time_series_with_mask_gap(SS.global_df.copy(), SS.imputed_mask, sensor_cols, sensor_color_map)
+        lightify(full_ts_fig)
         SS["ph_global"].plotly_chart(full_ts_fig, use_container_width=True, key=f"{uid}_global_{iter_key}")
 
-        # Snapshot 10
+        # --- Snapshot 10 (no legend) ---
         snap10 = SS.sliding_window_df.tail(SNAP10)
         snap10_fig = go.Figure()
         for col in sensor_cols:
             base_color = sensor_color_map[col]
-            sub = (snap10[["datetime", col]].dropna().sort_values("datetime").rename(columns={col:"value"}))
-            if sub.empty: continue
+            sub = (snap10[["datetime", col]].dropna()
+                   .sort_values("datetime").rename(columns={col: "value"}))
+            if sub.empty:
+                continue
             def is_imp(t, c=col):
-                try: return bool(mask_plot.loc[pd.Timestamp(t), c])
+                try: return bool(SS.imputed_mask.loc[t, c])
                 except: return False
             add_imputed_segments(snap10_fig, sub, is_imp, base_color, gap_hours=6)
-        snap10_fig.update_layout(title="Snapshot (last 10)",
+        snap10_fig.update_layout(title="Snapshot (last 10 timestamps)",
                                  xaxis_title="Time", yaxis_title="Value",
-                                 margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
-        lightify_safe(snap10_fig)
+                                 margin=dict(l=20, r=20, t=40, b=20),
+                                 showlegend=False)
+        lightify(snap10_fig)
+
         SS["ph_snap10"].plotly_chart(snap10_fig, use_container_width=True, key=f"{uid}_snap10_{iter_key}")
 
-        # --- avance + armement alertes ---
+        # advance pointer
         ptr += 1
         SS["sim_ptr"] = ptr
-        if not SS.get("alerts_armed", False):
-            time.sleep(float(intro_delay_seconds))
-            SS["alerts_armed"] = True
-        else:
-            time.sleep(1.0)
+        time.sleep(0)
+
 
 
 def run_tsguard_vs_pristi_comparison(
@@ -2412,9 +2537,11 @@ def run_tsguard_vs_pristi_comparison(
         return out
 
     def lightify(fig: go.Figure) -> None:
-        fig.update_layout(template="plotly_white",
-                          legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                          margin=dict(l=10, r=10, t=28, b=10))
+        fig.update_layout(
+            template="plotly_white",
+            margin=dict(l=150, r=10, t=28, b=10),
+            legend=dict(orientation="v", x=-0.02, xanchor="right", y=1.0, yanchor="top")
+            ,)
         fig.update_xaxes(showgrid=True, gridwidth=1, griddash="dot", type="date", tickformat="%Y-%m-%d %H:%M")
         fig.update_yaxes(showgrid=True, gridwidth=1, griddash="dot")
 
@@ -2615,7 +2742,7 @@ def run_tsguard_vs_pristi_comparison(
                                     key=f"cmp_steps_{cache_key_short}", on_change=_ui_only_changed)
     else:
         with sliders:
-            st.caption("⏳ Computing the first 36-step window… sliders will appear here once ready.")
+            st.caption("⏳ Please wait, this may take few minutes!")
         cmp_sensors = min(6, len(pristi_cols))
         cmp_steps   = min(36, eval_len)
 
@@ -2642,11 +2769,11 @@ def run_tsguard_vs_pristi_comparison(
         c2.plotly_chart(plot_block(disp_pri, pri_sets, cols_show, "PriSTI"),
                         use_container_width=True, key="plot_pri")
 
-        st.caption(
-            f"Red pts in window — TSGuard: "
-            f"{sum(len(set(tsg_sets[c]) & set(ts_index)) for c in cols_show)} • "
-            f"PriSTI: {sum(len(set(pri_sets[c]) & set(ts_index)) for c in cols_show)}"
-        )
+        # st.caption(
+        #     f"Red pts in window — TSGuard: "
+        #     f"{sum(len(set(tsg_sets[c]) & set(ts_index)) for c in cols_show)} • "
+        #     f"PriSTI: {sum(len(set(pri_sets[c]) & set(ts_index)) for c in cols_show)}"
+        # )
         st.markdown(
             f"**Imputation time — PriSTI: {store['sum_lastN_pri_ms']:.1f} ms • "
             f"TSGuard: {store['sum_lastN_tsg_ms']:.1f} ms**"
@@ -2660,7 +2787,7 @@ def run_tsguard_vs_pristi_comparison(
 
     # ---------------- compute / resume ----------------
     if not store["first_window_shown"]:
-        status_box = st.status("Preparing first 36-step window…", expanded=True)
+        status_box = st.status("Imputing the first window…", expanded=True)
         prog = st.progress(0)
     else:
         status_box = None; prog = None
@@ -2763,7 +2890,7 @@ def run_tsguard_vs_pristi_comparison(
                     c1, c2 = st.columns(2)
                     c1.slider("Sensors to display", 1, min(36, len(pristi_cols)),
                               min(6, len(pristi_cols)), key=f"cmp_sensors_{cache_key_short}", on_change=_ui_only_changed)
-                    c2.slider("Timestamps to display (≤36, last)", 6, 36,
+                    c2.slider("Timestamps to display", 3, 36,
                               36, key=f"cmp_steps_{cache_key_short}", on_change=_ui_only_changed)
                 st.session_state["_ui_only_rerun"] = True
                 st.stop()

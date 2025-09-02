@@ -239,7 +239,7 @@ def render_header():
           <details class="ts-about">
             <summary title="About TSGuard">❓</summary>
             <div class="about-note">
-              <b>About TSGuard (quick)</b><br/>
+              <b>About TSGuard </b><br/>
               Real-time detection and imputation of missing values in streaming environmental data, driven by a hybrid GNN+LSTM model with domain range checks.
               <br/><br/>
     """, unsafe_allow_html=True)
