@@ -103,12 +103,12 @@ Below are some screenshots of the TSGuard interface:
 ![Dashboard](docs/screenshots/Home.png)
 *Main dashboard displaying a sidebar to uplaod training data, sensor data & positions files.*
 
-![Settings](docs/screenshots/Contraints.png)
-*TSGuard configuration including:*
-- **Constraints**: spatial and temporal
-- **Signma Threshold**
-- **Missing Values**: to define the system states.
-- **Graph Size**
+![Settings](docs/screenshots/Constraints.png)
+*TSGuard spatial and temporal constraints
+- The settings also include defining:
+       **Thresholds** of acceptable delay time
+       **Missing Values**: to define the system states.
+       **Graph Size**
 
 ![Sensor Graph](docs/screenshots/Imputation.png)
 *Example visualization of sensors & imputation charts.* 
